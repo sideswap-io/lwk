@@ -172,6 +172,7 @@ pub struct TxBuilder {
     fee_rate: f32,
     ct_discount: bool,
     issuance_request: IssuanceRequest,
+    blind: bool,
     drain_lbtc: bool,
     drain_to: Option<Address>,
     external_utxos: Vec<ExternalUtxo>,
@@ -194,6 +195,7 @@ impl TxBuilder {
             fee_rate: 100.0,
             ct_discount: true,
             issuance_request: IssuanceRequest::None,
+            blind: true,
             drain_lbtc: false,
             drain_to: None,
             external_utxos: vec![],
@@ -288,6 +290,12 @@ impl TxBuilder {
         if let Some(fee_rate) = fee_rate {
             self.fee_rate = fee_rate
         }
+        self
+    }
+
+    /// SIDESWAP: Disable blinding
+    pub fn blind(mut self, blind: bool) -> Self {
+        self.blind = blind;
         self
     }
 
@@ -1236,9 +1244,13 @@ impl TxBuilder {
                 (*i, s)
             })
             .collect();
-        let blind_secrets = pset26
-            .blind_last(&mut rng, &EC, &inp_txout_sec)
-            .map_err(|e| Error::Generic(format!("elements26 blind error: {e}")))?;
+        let blind_secrets = if self.blind {
+            pset26
+                .blind_last(&mut rng, &EC, &inp_txout_sec)
+                .map_err(|e| Error::Generic(format!("elements26 blind error: {e}")))?
+        } else {
+            BTreeMap::new()
+        };
         // erase all non witness utxo surjection and range proofs
         // this appears to be necessary for pre-segwit inputs
         for input in pset26.inputs_mut() {
@@ -1255,8 +1267,10 @@ impl TxBuilder {
             blind_secrets,
         };
 
-        // Add details to the pset from our descriptor, like bip32derivation and keyorigin
-        wollet.add_details(&mut built_tx.pset)?;
+        if self.blind {
+            // Add details to the pset from our descriptor, like bip32derivation and keyorigin
+            wollet.add_details(&mut built_tx.pset)?;
+        }
 
         Ok(built_tx)
     }
@@ -1564,6 +1578,14 @@ impl<'a> WolletTxBuilder<'a> {
                 issuance_tx,
             )?,
         })
+    }
+
+    /// SIDESWAP: Disable blinding
+    pub fn blind(self, blind: bool) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.blind(blind),
+        }
     }
 
     /// Wrapper of [`TxBuilder::drain_lbtc_wallet()`]
