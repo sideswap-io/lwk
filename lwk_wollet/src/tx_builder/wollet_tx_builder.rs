@@ -229,6 +229,14 @@ impl<'a> WolletTxBuilder<'a> {
         })
     }
 
+    /// SIDESWAP: Disable blinding
+    pub fn blind(self, blind: bool) -> Self {
+        Self {
+            wollet: self.wollet,
+            inner: self.inner.blind(blind),
+        }
+    }
+
     /// Wrapper of [`TxBuilder::drain_lbtc_wallet()`]
     pub fn drain_lbtc_wallet(self) -> Self {
         Self {

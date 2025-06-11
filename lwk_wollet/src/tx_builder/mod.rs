@@ -259,6 +259,7 @@ pub struct TxBuilder {
     ct_discount: bool,
     reissuances: Reissuances,
     issuances: Issuances,
+    blind: bool,
     drain_lbtc: bool,
     drain_to: Option<Address>,
     external_utxos: Vec<ExternalUtxo>,
@@ -287,6 +288,7 @@ impl TxBuilder {
             ct_discount: true,
             reissuances: Reissuances::default(),
             issuances: Issuances::None,
+            blind: true,
             drain_lbtc: false,
             drain_to: None,
             external_utxos: vec![],
@@ -397,6 +399,12 @@ impl TxBuilder {
     /// Allow a fee rate higher than [`TxBuilder::MAX_FEE_RATE`]
     pub fn allow_high_fee_rate(mut self) -> Self {
         self.allow_high_fee_rate = true;
+        self
+    }
+
+    /// SIDESWAP: Disable blinding
+    pub fn blind(mut self, blind: bool) -> Self {
+        self.blind = blind;
         self
     }
 

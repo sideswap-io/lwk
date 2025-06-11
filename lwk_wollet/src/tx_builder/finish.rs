@@ -652,7 +652,7 @@ impl TxBuilder {
         // TODO inputs/outputs(except fee) randomization, not trivial because of blinder_index on inputs
 
         // Blind the transaction
-        let mut built_tx = if needs_blinding(&pset)? {
+        let mut built_tx = if self.blind && needs_blinding(&pset)? {
             let mut rng = thread_rng();
 
             let blind_secrets = pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
@@ -683,8 +683,10 @@ impl TxBuilder {
             }
         };
 
-        // Add details to the pset from our descriptor, like bip32derivation and keyorigin
-        wollet.add_details(&mut built_tx.pset)?;
+        if self.blind {
+            // Add details to the pset from our descriptor, like bip32derivation and keyorigin
+            wollet.add_details(&mut built_tx.pset)?;
+        }
 
         Ok(built_tx)
     }
