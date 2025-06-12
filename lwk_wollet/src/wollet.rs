@@ -34,7 +34,7 @@ use std::sync::{atomic, Arc};
 /// A watch-only wallet defined by a CT descriptor.
 pub struct Wollet {
     pub(crate) config: Config,
-    pub(crate) store: Store,
+    pub store: Store,
     pub(crate) persister: Arc<dyn Persister + Send + Sync>,
     descriptor: WolletDescriptor,
     // cached value
