@@ -3,6 +3,7 @@ use crate::Error;
 use crate::History;
 
 use electrum_client::ScriptStatus;
+pub use electrum_client::Socks5Config;
 use electrum_client::{Client, ConfigBuilder, ElectrumApi, GetHistoryRes};
 use elements::encode::deserialize as elements_deserialize;
 use elements::encode::serialize as elements_serialize;
@@ -100,7 +101,9 @@ impl ElectrumUrl {
             }
             ElectrumUrl::Plaintext(url) => (format!("tcp://{}", url), builder),
         };
-        let builder = builder.timeout(options.timeout);
+        let builder = builder
+            .timeout(options.timeout)
+            .socks5(options.socks5.clone());
         Ok(Client::from_config(&url, builder.build())?)
     }
 }
@@ -117,6 +120,7 @@ impl Debug for ElectrumClient {
 #[derive(Default)]
 pub struct ElectrumOptions {
     pub timeout: Option<u8>,
+    pub socks5: Option<Socks5Config>,
 }
 
 impl ElectrumClient {
