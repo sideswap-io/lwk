@@ -45,7 +45,8 @@ sha256t_hash_newtype! {
 /// A watch-only wallet defined by a CT descriptor.
 pub struct Wollet {
     pub(crate) network: Network,
-    pub(crate) cache: Cache,
+    /// Cache
+    pub cache: Cache,
     pub(crate) descriptor: WolletDescriptor,
 
     // Fields for managing `Update`s
