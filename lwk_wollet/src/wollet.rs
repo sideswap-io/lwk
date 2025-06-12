@@ -52,7 +52,8 @@ pub(crate) fn update_key(index: usize) -> String {
 /// A watch-only wallet defined by a CT descriptor.
 pub struct Wollet {
     pub(crate) network: ElementsNetwork,
-    pub(crate) cache: Cache,
+    /// Cache
+    pub cache: Cache,
     pub(crate) store: Arc<dyn DynStore>,
     pub(crate) descriptor: WolletDescriptor,
     /// Counter for the next update key
