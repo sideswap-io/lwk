@@ -10,9 +10,9 @@ use lwk_wollet::{
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 
-/// A Liquid transaction, wrapper of [`elements::Transaction`]
+/// A Liquid transaction
 ///
-/// See [`crate::WalletTx`] for the transaction as seen from the perspective of the wallet
+/// See `WalletTx` for the transaction as seen from the perspective of the wallet
 /// where you can actually see unblinded amounts and tx net-balance.
 #[wasm_bindgen]
 #[derive(PartialEq, Eq, Debug, Hash, Clone)]
@@ -38,6 +38,12 @@ impl From<Transaction> for elements::Transaction {
     }
 }
 
+impl AsRef<elements::Transaction> for Transaction {
+    fn as_ref(&self) -> &elements::Transaction {
+        &self.inner
+    }
+}
+
 #[wasm_bindgen]
 impl Transaction {
     /// Creates a `Transaction`
@@ -48,18 +54,23 @@ impl Transaction {
         Ok(tx.into())
     }
 
+    /// Return the transaction identifier.
     pub fn txid(&self) -> Txid {
         self.inner.txid().into()
     }
 
+    /// Return the consensus encoded bytes of the transaction.
     pub fn bytes(&self) -> Vec<u8> {
         elements::Transaction::serialize(&self.inner)
     }
 
+    /// Return the fee of the transaction in the given asset.
+    /// At the moment the only asset that can be used as fee is the policy asset (LBTC for mainnet).
     pub fn fee(&self, policy_asset: &AssetId) -> u64 {
         self.inner.fee_in((*policy_asset).into())
     }
 
+    /// Return the hex representation of the transaction. More precisely, they are the consensus encoded bytes of the transaction converted in hex.
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)
@@ -95,12 +106,14 @@ impl From<Txid> for elements::Txid {
 
 #[wasm_bindgen]
 impl Txid {
-    /// Creates a `Txid`
+    /// Creates a `Txid` from its hex string representation (64 characters).
     #[wasm_bindgen(constructor)]
     pub fn new(tx_id: &str) -> Result<Txid, Error> {
         Ok(elements::Txid::from_str(tx_id)?.into())
     }
 
+    /// Return the string representation of the transaction identifier as shown in the explorer.
+    /// This representation can be used to recreate the transaction identifier via `new()`
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)

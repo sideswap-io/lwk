@@ -1,7 +1,7 @@
 //! Blocking clients to fetch data from the Blockchain.
 
 use crate::{
-    clients::try_unblind,
+    clients::{create_dummy_tx, try_unblind},
     store::{Height, Timestamp, BATCH_SIZE},
     update::{DownloadTxResult, Update},
     wollet::WolletState,
@@ -56,6 +56,12 @@ pub trait BlockchainBackend {
         HashSet::new()
     }
 
+    /// Whether the client is configured to only fetch transactions with unspent outputs (false by default)
+    fn utxo_only(&self) -> bool {
+        false
+    }
+
+    /// Get the wallet history
     fn get_history<S: WolletState>(
         &mut self,
         descriptor: &WolletDescriptor,
@@ -127,6 +133,7 @@ pub trait BlockchainBackend {
         Ok(data)
     }
 
+    /// Get the history using the waterfalls endpoint
     fn get_history_waterfalls<S: WolletState>(
         &mut self,
         _descriptor: &WolletDescriptor,
@@ -162,6 +169,8 @@ pub trait BlockchainBackend {
     /// If transactions are found beyond the gap limit during this scan, subsequent calls to
     /// [`BlockchainBackend::full_scan()`] will automatically scan up to the highest used index, preventing any
     /// previously-found transactions from being missed.
+    ///
+    /// See [`crate::asyncr::EsploraClient::full_scan_to_index()`] for an async version of this method.
     fn full_scan_to_index<S: WolletState>(
         &mut self,
         state: &S,
@@ -176,6 +185,7 @@ pub trait BlockchainBackend {
             height_blockhash,
             height_timestamp: _height_timestamp,
             tip: _,
+            unspent,
         } = if self.capabilities().contains(&Capability::Waterfalls) {
             match self.get_history_waterfalls(&descriptor, state, index) {
                 Ok(d) => d,
@@ -191,7 +201,13 @@ pub trait BlockchainBackend {
         let tip = self.tip()?;
 
         let history_txs_id: HashSet<Txid> = txid_height.keys().cloned().collect();
-        let new_txs = self.download_txs(&history_txs_id, &scripts, state, &descriptor)?;
+        let mut new_txs = self.download_txs(&history_txs_id, &scripts, state, &descriptor)?;
+
+        if self.utxo_only() {
+            let tx = create_dummy_tx(&unspent, &new_txs);
+            new_txs.txs.push((tx.txid(), tx));
+        }
+
         let history_txs_heights_plus_tip: HashSet<Height> = txid_height
             .values()
             .filter_map(|e| *e)
@@ -285,7 +301,7 @@ pub trait BlockchainBackend {
                         vout,
                     };
 
-                    match try_unblind(output.clone(), descriptor) {
+                    match try_unblind(output, descriptor) {
                             Ok(unblinded) => unblinds.push((outpoint, unblinded)),
                             Err(_) => log::info!("{} cannot unblind, ignoring (could be sender messed up with the blinding process)", outpoint),
                         }

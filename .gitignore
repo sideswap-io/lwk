@@ -13,3 +13,8 @@ context/jade-emulator/Dockerfile
 result
 *__pycache__
 venv/
+node_modules/
+docs/book/
+lwk_boltz/Cargo.lock
+lwk_bindings/examples/swaps/
+.cursor/

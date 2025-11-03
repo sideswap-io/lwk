@@ -37,12 +37,12 @@ use lwk_wollet::bitcoin::XKeyIdentifier;
 use lwk_wollet::clients::blocking::BlockchainBackend;
 use lwk_wollet::elements::encode::serialize;
 use lwk_wollet::elements::hex::{FromHex, ToHex};
-use lwk_wollet::elements::pset::elip100::TokenMetadata;
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 use lwk_wollet::elements::{Address, AssetId, OutPoint, Txid};
 use lwk_wollet::elements_miniscript::descriptor::{Descriptor, DescriptorType, WshInner};
 use lwk_wollet::elements_miniscript::miniscript::decode::Terminal;
 use lwk_wollet::elements_miniscript::{DescriptorPublicKey, ForEachKey};
+use lwk_wollet::registry::add_contracts;
 use lwk_wollet::LiquidexProposal;
 use lwk_wollet::Wollet;
 use lwk_wollet::WolletDescriptor;
@@ -526,6 +526,8 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let wollet = s.wollets.get_mut(&r.name)?;
             let mut balance = wollet
                 .balance()?
+                .as_ref()
+                .clone()
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v as i64))
                 .collect();
@@ -553,7 +555,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .fee_rate(r.fee_rate);
             let mut tx = builder.finish()?;
 
-            add_contracts(&mut tx, s.assets.iter());
+            add_contracts(&mut tx, s.registry_asset_data());
             Response::result(
                 request.id,
                 serde_json::to_value(response::Pset {
@@ -574,7 +576,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .fee_rate(r.fee_rate)
                 .finish()?;
 
-            add_contracts(&mut tx, s.assets.iter());
+            add_contracts(&mut tx, s.registry_asset_data());
             Response::result(
                 request.id,
                 serde_json::to_value(response::Pset {
@@ -689,6 +691,33 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 request.id,
                 serde_json::to_value(response::Pset {
                     pset: pset.to_string(),
+                })?,
+            )
+        }
+        Method::SignerDeriveBip85 => {
+            let r: request::SignerDeriveBip85 = serde_json::from_value(params)?;
+            let mut s = state.lock()?;
+
+            let signer = s.get_available_signer(&r.name)?;
+
+            // Only software signers support BIP85 derivation
+            let sw_signer = match signer {
+                AnySigner::Software(sw) => sw,
+                _ => {
+                    return Err(Error::Generic(
+                        "BIP85 derivation is only supported for software signers".to_string(),
+                    ))
+                }
+            };
+
+            let derived_mnemonic = sw_signer
+                .derive_bip85_mnemonic(r.index, r.word_count)
+                .map_err(|e| Error::Generic(format!("BIP85 derivation failed: {}", e)))?;
+
+            Response::result(
+                request.id,
+                serde_json::to_value(response::SignerDeriveBip85 {
+                    mnemonic: derived_mnemonic.to_string(),
                 })?,
             )
         }
@@ -812,8 +841,9 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
             let mut balance: HashMap<String, i64> = details
                 .balance
                 .balances
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
+                .as_ref()
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
                 .collect();
             if r.with_tickers {
                 balance = s.replace_id_with_ticker(balance);
@@ -1040,7 +1070,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .fee_rate(r.fee_rate)
                 .finish()?;
 
-            add_contracts(&mut pset, s.assets.iter());
+            add_contracts(&mut pset, s.registry_asset_data());
             Response::result(
                 request.id,
                 serde_json::to_value(response::Pset {
@@ -1060,7 +1090,7 @@ fn inner_method_handler(request: Request, state: Arc<Mutex<State>>) -> Result<Re
                 .fee_rate(r.fee_rate)
                 .finish()?;
 
-            add_contracts(&mut pset, s.assets.iter());
+            add_contracts(&mut pset, s.registry_asset_data());
             Response::result(
                 request.id,
                 serde_json::to_value(response::Pset {
@@ -1322,31 +1352,6 @@ fn signer_details(name: &str, signer: &AppSigner) -> Result<response::SignerDeta
     })
 }
 
-fn add_contracts<'a>(
-    pset: &mut PartiallySignedTransaction,
-    assets: impl Iterator<Item = (&'a AssetId, &'a AppAsset)>,
-) {
-    let assets_in_pset: HashSet<_> = pset.outputs().iter().filter_map(|o| o.asset).collect();
-    for (_, asset) in assets {
-        if let AppAsset::RegistryAsset(registry_data) = asset {
-            // Policy asset and reissuance tokens do not require the contract
-            let asset_id = asset.asset_id();
-            if assets_in_pset.contains(&asset_id) {
-                if let Some(metadata) = asset.asset_metadata() {
-                    pset.add_asset_metadata(asset_id, &metadata);
-                    let token_id = registry_data.reissuance_token();
-                    // TODO: handle blinded issuance
-                    let issuance_blinded = false;
-                    pset.add_token_metadata(
-                        token_id,
-                        &TokenMetadata::new(token_id, issuance_blinded),
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn convert_utxo(u: &lwk_wollet::WalletTxOut) -> response::Utxo {
     response::Utxo {
         txid: u.outpoint.txid.to_string(),
@@ -1390,9 +1395,14 @@ fn amp2userkey(signer: &AnySigner) -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
-
     use super::*;
+    use crate::state::AppAsset;
+    use lwk_wollet::elements::pset::{elip100::PSET_HWW_PREFIX, PartiallySignedTransaction};
+    use lwk_wollet::elements::AssetId;
+    use lwk_wollet::{Contract, RegistryAssetData};
+    use std::collections::HashMap;
+    use std::net::TcpListener;
+    use std::str::FromStr;
 
     fn app_random_port() -> App {
         let addr = TcpListener::bind("127.0.0.1:0")
@@ -1423,5 +1433,94 @@ mod tests {
 
         app.stop().unwrap();
         app.join_threads().unwrap();
+    }
+
+    #[test]
+    fn add_contracts_embeds_valid_metadata() {
+        // Prepare and validate contract
+        let contract_json = r#"{"entity":{"domain":"example.com"},"issuer_pubkey":"020202020202020202020202020202020202020202020202020202020202020202","name":"MyCoin","precision":0,"ticker":"MYCO","version":0}"#;
+        let contract_value = serde_json::Value::from_str(contract_json).unwrap();
+        let contract = Contract::from_value(&contract_value).unwrap();
+        contract.validate().unwrap();
+        let contract_serialized = serde_json::to_string(&contract).unwrap();
+        assert_eq!(contract_serialized, contract_json);
+
+        // Load PSET
+        let pset_str = include_str!("../test_data/issuance_pset.base64");
+        let mut pset = PartiallySignedTransaction::from_str(pset_str).unwrap();
+
+        // Remove asset metadata preserving initial number of proprietary keys
+        let n_proprietary_keys = pset.global.proprietary.len();
+        pset.global
+            .proprietary
+            .retain(|key, _| !key.prefix.starts_with(PSET_HWW_PREFIX));
+        assert!(pset
+            .global
+            .proprietary
+            .keys()
+            .all(|key| !key.prefix.starts_with(PSET_HWW_PREFIX)));
+        let removed = n_proprietary_keys - pset.global.proprietary.len();
+        assert_eq!(
+            removed, 2,
+            "Expected to remove 2 proprietary keys with HWW prefix"
+        );
+
+        // Extract transaction
+        let tx = pset.extract_tx().unwrap();
+
+        // Prepare assets map
+        let mut assets_map: HashMap<AssetId, AppAsset> = HashMap::new();
+        let asset_id =
+            AssetId::from_str("25e85efe02e5010a880ddb7c936e82896cd7fc493d2a5bc4422e8ec26100b00d")
+                .unwrap();
+        let asset_data = RegistryAssetData::new(asset_id, tx.clone(), contract.clone())
+            .expect("valid registry data");
+        let token_id = asset_data.reissuance_token();
+        assets_map.insert(asset_id, AppAsset::RegistryAsset(asset_data.clone()));
+        assets_map.insert(token_id, AppAsset::ReissuanceToken(asset_data.clone()));
+
+        // TODO: check with a test vector, this is the value generated once the entropy fn has been introduced
+        assert_eq!(
+            asset_data.entropy().unwrap(),
+            [
+                246, 117, 58, 147, 49, 238, 254, 149, 30, 173, 173, 99, 251, 157, 220, 73, 16, 39,
+                72, 67, 153, 90, 118, 180, 236, 207, 166, 53, 173, 215, 201, 113
+            ],
+        );
+
+        // Add contracts
+        add_contracts(&mut pset, [&asset_data].into_iter());
+
+        // Ensure the asset metadata records are fully re-created
+        assert_eq!(
+            pset.global.proprietary.len(),
+            n_proprietary_keys,
+            "Contract metadata was not fully restored"
+        );
+
+        // Assert asset metadata is present and valid
+        let asset_meta = pset.get_asset_metadata(asset_id).unwrap().unwrap();
+        assert_eq!(
+            asset_meta.contract(),
+            contract_json,
+            "Invalid contract in asset metadata"
+        );
+        assert_eq!(
+            asset_meta.issuance_prevout(),
+            asset_data.issuance_prevout(),
+            "Invalid issuance prevout in asset metadata"
+        );
+
+        // Assert token metadata is present and valid
+        let token_meta = pset.get_token_metadata(token_id).unwrap().unwrap();
+        assert_eq!(
+            token_meta.asset_id(),
+            &asset_id,
+            "Invalid asset tag in reissuance token metadata"
+        );
+        assert!(
+            !token_meta.issuance_blinded(),
+            "Invalid issuance blinded flag in reissuance token metadata"
+        );
     }
 }

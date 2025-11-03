@@ -3,7 +3,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::{AssetId, EsploraClient, TxBuilder};
 
-/// Wrapper of [`lwk_wollet::ElementsNetwork`]
+/// The network of the elements blockchain such as mainnet, testnet or regtest.
 #[wasm_bindgen]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Network {
@@ -74,6 +74,7 @@ impl Network {
         lwk_wollet::ElementsNetwork::ElementsRegtest { policy_asset }.into()
     }
 
+    /// Return the default esplora client for this network
     #[wasm_bindgen(js_name = defaultEsploraClient)]
     pub fn default_esplora_client(&self) -> EsploraClient {
         let url = match &self.inner {
@@ -84,19 +85,22 @@ impl Network {
             lwk_wollet::ElementsNetwork::ElementsRegtest { policy_asset: _ } => "127.0.0.1:3000",
         };
 
-        EsploraClient::new(self, url, false, 1)
+        EsploraClient::new(self, url, false, 1, false).unwrap()
     }
 
+    /// Return true if the network is a mainnet network
     #[wasm_bindgen(js_name = isMainnet)]
     pub fn is_mainnet(&self) -> bool {
         matches!(&self.inner, &lwk_wollet::ElementsNetwork::Liquid)
     }
 
+    /// Return true if the network is a testnet network
     #[wasm_bindgen(js_name = isTestnet)]
     pub fn is_testnet(&self) -> bool {
         matches!(&self.inner, &lwk_wollet::ElementsNetwork::LiquidTestnet)
     }
 
+    /// Return true if the network is a regtest network
     #[wasm_bindgen(js_name = isRegtest)]
     pub fn is_regtest(&self) -> bool {
         matches!(
@@ -105,21 +109,25 @@ impl Network {
         )
     }
 
+    /// Return a string representation of the network, like "liquid", "liquid-testnet" or "liquid-regtest"
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)
     }
 
+    /// Return the policy asset for this network
     #[wasm_bindgen(js_name = policyAsset)]
     pub fn policy_asset(&self) -> AssetId {
         self.inner.policy_asset().into()
     }
 
+    /// Return the transaction builder for this network
     #[wasm_bindgen(js_name = txBuilder)]
     pub fn tx_builder(&self) -> TxBuilder {
         TxBuilder::new(self)
     }
 
+    /// Return the default explorer URL for this network
     #[wasm_bindgen(js_name = defaultExplorerUrl)]
     pub fn default_explorer_url(&self) -> String {
         let url = match &self.inner {

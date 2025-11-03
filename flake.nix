@@ -81,7 +81,7 @@
             # craneLib.crateNameFromCargoToml { cargoToml = ./path/to/Cargo.toml; }
             # but I can't make it work
             pname = "lwk_cli";
-            version = "0.9.0";
+            version = "0.12.0";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           # remember, `set1 // set2` does a shallow merge:
@@ -96,6 +96,16 @@
             '';
           });
 
+          # Build mdbook-snippets from local source
+          mdbook-snippets = craneLib.buildPackage {
+            src = lib.cleanSource ./docs/snippets/processor;
+            inherit nativeBuildInputs;
+            buildInputs = [  ];
+            
+            pname = "mdbook-snippets";
+            version = "0.1.0";
+          };
+
         in
         {
           packages =
@@ -104,12 +114,13 @@
               # but it's also the default.
               inherit bin;
               default = bin;
+              inherit mdbook-snippets;
             };
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [ bin ];
 
-            buildInputs = [ registry.bin rustToolchain pkgs.websocat ];
+            buildInputs = [ registry.bin rustToolchain pkgs.websocat pkgs.heaptrack pkgs.mdbook pkgs.mdbook-mermaid mdbook-snippets ];
 
             ELEMENTSD_EXEC = "${pkgs.elementsd}/bin/elementsd";
             BITCOIND_EXEC = "${pkgs.bitcoind}/bin/bitcoind";

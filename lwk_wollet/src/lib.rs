@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
 
 //! LWK is a collection of libraries for Liquid wallets.
 //! `lwk_wollet` is the library for Watch-Only Wallets, the `wollet` spelling is not a typo but highlights the fact it is Watch-Only.
@@ -88,8 +89,11 @@
 //! # }
 //! ```
 
+#[cfg(feature = "amp0")]
+pub mod amp0;
 #[cfg(feature = "amp2")]
 pub mod amp2;
+
 pub mod clients;
 mod config;
 mod descriptor;
@@ -105,6 +109,7 @@ mod store;
 mod tx_builder;
 mod update;
 mod util;
+mod wamp;
 mod wollet;
 
 pub use crate::clients::{Capability, History};
@@ -118,7 +123,7 @@ pub use crate::model::{
 };
 pub use crate::pegin::fed_peg_script;
 pub use crate::persister::{FsPersister, NoPersist, PersistError, Persister};
-pub use crate::registry::{asset_ids, issuance_ids, Contract, Entity};
+pub use crate::registry::{asset_ids, issuance_ids, Contract, Entity, RegistryAssetData};
 pub use crate::tx_builder::{TxBuilder, WolletTxBuilder};
 pub use crate::update::{DownloadTxResult, Update};
 pub use crate::util::EC;
@@ -152,4 +157,17 @@ pub use elements_miniscript;
 pub use elements_miniscript::elements;
 pub use elements_miniscript::elements::bitcoin::{self, hashes, secp256k1};
 
+/// The blinding public key used for confidential addresses.
 pub type BlindingPublicKey = elements::secp256k1_zkp::PublicKey;
+
+pub(crate) mod hex {
+    use elements::{hashes::hex::DisplayHex, hex::Error, hex::FromHex};
+
+    pub fn encode(data: &[u8]) -> String {
+        data.to_lower_hex_string()
+    }
+
+    pub fn _decode(data: &str) -> Result<Vec<u8>, Error> {
+        Vec::<u8>::from_hex(data)
+    }
+}

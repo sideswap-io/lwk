@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
 use crate::{Bip, Error, Mnemonic, Network, Pset, WolletDescriptor, Xpub};
+use lwk_common::Signer as SignerTrait;
 use lwk_wollet::{
-    bitcoin::bip32, elements::pset::PartiallySignedTransaction, elements_miniscript::slip77,
+    bitcoin::bip32, bitcoin::sign_message::MessageSignature,
+    elements::pset::PartiallySignedTransaction, elements_miniscript::slip77,
 };
 use wasm_bindgen::prelude::*;
 
-/// A Software signer, wrapper of [`lwk_signer::SwSigner`]
+/// A Software signer.
 #[wasm_bindgen]
 pub struct Signer {
-    inner: lwk_signer::SwSigner,
+    pub(crate) inner: lwk_signer::SwSigner,
 }
 
 #[wasm_bindgen]
@@ -41,6 +43,7 @@ impl Signer {
         Ok(signature.to_string())
     }
 
+    /// Return the witness public key hash, slip77 descriptor of this signer
     #[wasm_bindgen(js_name = wpkhSlip77Descriptor)]
     pub fn wpkh_slip77_descriptor(&self) -> Result<WolletDescriptor, Error> {
         // TODO: make script_variant and blinding_variant parameters
@@ -53,11 +56,13 @@ impl Signer {
         WolletDescriptor::new(&desc_str)
     }
 
+    /// Return the extended public key of the signer
     #[wasm_bindgen(js_name = getMasterXpub)]
     pub fn get_master_xpub(&self) -> Result<Xpub, Error> {
         Ok(self.inner.xpub().into())
     }
 
+    /// Return keyorigin and xpub, like "[73c5da0a/84h/1h/0h]tpub..."
     #[wasm_bindgen(js_name = keyoriginXpub)]
     pub fn keyorigin_xpub(&self, bip: &Bip) -> Result<String, Error> {
         Ok(lwk_common::Signer::keyorigin_xpub(
@@ -67,11 +72,22 @@ impl Signer {
         )?)
     }
 
+    /// Return the signer fingerprint
+    pub fn fingerprint(&self) -> Result<String, Error> {
+        Ok(self.inner.fingerprint().to_string())
+    }
+
+    /// Return the mnemonic of the signer
     pub fn mnemonic(&self) -> Mnemonic {
         self.inner
             .mnemonic()
             .expect("wasm bindings always create signer via mnemonic and not via xpriv")
             .into()
+    }
+
+    /// Return the derived BIP85 mnemonic
+    pub fn derive_bip85_mnemonic(&self, index: u32, word_count: u32) -> Result<Mnemonic, Error> {
+        Ok(self.inner.derive_bip85_mnemonic(index, word_count)?.into())
     }
 }
 
@@ -99,6 +115,14 @@ impl lwk_common::Signer for FakeSigner {
 
     fn slip77_master_blinding_key(&self) -> Result<slip77::MasterBlindingKey, Self::Error> {
         Ok(self.slip77)
+    }
+
+    fn sign_message(
+        &self,
+        _message: &str,
+        _path: &bip32::DerivationPath,
+    ) -> Result<MessageSignature, Self::Error> {
+        unimplemented!()
     }
 }
 
@@ -144,5 +168,23 @@ mod tests {
         assert_eq!(signer.mnemonic(), mnemonic);
 
         assert_eq!(signer.sign_message("Hello, world!").unwrap(), "Hwlg40qLYZXEj9AoA3oZpfJMJPxaXzBL0+siHAJRhTIvSFiwSdtCsqxqB7TxgWfhqIr/YnGE4nagWzPchFJElTo=");
+
+        // Test BIP85 derivation
+        assert_eq!(
+            signer.derive_bip85_mnemonic(0, 12).unwrap().to_string(),
+            "prosper short ramp prepare exchange stove life snack client enough purpose fold"
+        );
+
+        assert_eq!(signer.derive_bip85_mnemonic(0, 24).unwrap().to_string(), "stick exact spice sock filter ginger museum horse kit multiply manual wear grief demand derive alert quiz fault december lava picture immune decade jaguar");
+
+        assert_ne!(
+            signer.derive_bip85_mnemonic(0, 12).unwrap().to_string(),
+            signer.derive_bip85_mnemonic(1, 12).unwrap().to_string()
+        );
+
+        assert_eq!(
+            signer.derive_bip85_mnemonic(0, 12).unwrap().to_string(),
+            signer.derive_bip85_mnemonic(0, 12).unwrap().to_string()
+        );
     }
 }

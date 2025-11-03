@@ -3,7 +3,7 @@ use lwk_wollet::elements;
 use std::fmt::Display;
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`elements::OutPoint`]
+/// A reference to a transaction output
 #[wasm_bindgen]
 pub struct OutPoint {
     inner: elements::OutPoint,
@@ -36,10 +36,12 @@ impl OutPoint {
         Ok(out_point.into())
     }
 
+    /// Return the transaction identifier.
     pub fn txid(&self) -> Txid {
         self.inner.txid.into()
     }
 
+    /// Return the output index.
     pub fn vout(&self) -> u32 {
         self.inner.vout
     }

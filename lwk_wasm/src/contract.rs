@@ -2,7 +2,7 @@ use crate::Error;
 use lwk_wollet::hashes::hex::FromHex;
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`lwk_wollet::Contract`]
+/// A contract defining metadata of an asset such the name and the ticker
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct Contract {
@@ -52,15 +52,22 @@ impl Contract {
         Ok(Self { inner })
     }
 
+    /// Return the string representation of the contract.
+    // TODO: implement the viceversa Contract::from_str
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)
     }
 
+    /// Return the domain of the issuer of the contract.
     pub fn domain(&self) -> String {
         self.inner.entity.domain().to_string()
     }
 
+    /// Make a copy of the contract.
+    ///
+    /// This is needed to pass it to a function that requires a `Contract` (without borrowing)
+    /// but you need the same contract after that call.
     #[wasm_bindgen(js_name = clone)]
     pub fn clone_js(&self) -> Contract {
         // This is unusual, but I can get around of passing Option<Contract> to the issue_asset by borrowing

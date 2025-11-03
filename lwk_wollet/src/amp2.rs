@@ -16,10 +16,15 @@ use elements::pset::PartiallySignedTransaction;
 use lwk_common::keyorigin_xpub_from_str;
 use serde::{Deserialize, Serialize};
 
+/// The fingerprint of the AMP2 server key for the testnet network.
 pub const FINGERPRINT_TESTNET: &str = "3d970d04";
+/// The xpub of the AMP2 server key for the testnet network.
 pub const XPUB_TESTNET: &str = "tpubDC347GyKEGtyd4swZDaEmBTcNuqseyX7E3Yw58FoeV1njuBcUmBMr5vBeBh6eRsxKYHeCAEkKj8J2p2dBQQJwB8n33uyAPrdgwFxLFTCXRd";
+/// The derivation path of the AMP2 server key for the testnet network.
 pub const DERIVATION_PATH_TESTNET: &str = "m/87h/1h/0h";
+/// The keyorigin xpub of the AMP2 server key for the testnet network.
 pub const KEYORIGIN_XPUB_TESTNET: &str = "[3d970d04/87h/1h/0h]tpubDC347GyKEGtyd4swZDaEmBTcNuqseyX7E3Yw58FoeV1njuBcUmBMr5vBeBh6eRsxKYHeCAEkKj8J2p2dBQQJwB8n33uyAPrdgwFxLFTCXRd";
+/// The URL of the AMP2 server for the testnet network.
 pub const URL_TESTNET: &str = "https://amp2.testnet.blockstream.com/";
 
 /// Context for actions interacting with AMP2
@@ -39,6 +44,7 @@ impl Amp2Descriptor {
         Self { inner }
     }
 
+    /// Return a copy of this Amp2 descriptor.
     pub fn descriptor(&self) -> WolletDescriptor {
         self.inner.clone()
     }
@@ -55,8 +61,10 @@ struct RegisterRequest {
     descriptor: String,
 }
 
+/// Response from the AMP2 server when registering a wallet
 #[derive(Serialize, Deserialize)]
 pub struct RegisterResponse {
+    /// The AMP2 wallet id, should match [`WolletDescriptor::dwid()`]
     pub wid: String,
 }
 
@@ -70,8 +78,10 @@ struct CosignResponseInner {
     pset: String,
 }
 
+/// Response from the AMP2 server when cosigning a PSET
 #[derive(Serialize, Deserialize)]
 pub struct CosignResponse {
+    /// The cosigned PSET
     pub pset: PartiallySignedTransaction,
 }
 
@@ -85,6 +95,7 @@ impl TryFrom<CosignResponseInner> for CosignResponse {
 }
 
 impl Amp2 {
+    /// Create a new AMP2 client with the default url and server key for the testnet network.
     pub fn new_testnet() -> Self {
         Self {
             server_key: KEYORIGIN_XPUB_TESTNET.into(),

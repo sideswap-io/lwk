@@ -2,6 +2,7 @@ use elements::OutPoint;
 
 /// Error type for the whole crate.
 #[derive(thiserror::Error, Debug)]
+#[allow(missing_docs)]
 pub enum Error {
     #[error("{0}")]
     Generic(String),
@@ -105,6 +106,9 @@ pub enum Error {
 
     #[error(transparent)]
     PersistError(#[from] crate::persister::PersistError),
+
+    #[error("Address must be explicit")]
+    NotExplicitAddress,
 
     #[error("Address must be confidential")]
     NotConfidentialAddress,
@@ -227,6 +231,41 @@ pub enum Error {
 
     #[error("Issuance amount greater than 21M*10^8 are not allowed")]
     IssuanceAmountGreaterThanBtcMax,
+
+    #[error("Number of transaction inputs ({0}) exceeds maximum allowed input count of 256")]
+    TooManyInputs(usize),
+
+    #[error("Cannot use derivation index when the descriptor has no wildcard")]
+    IndexWithoutWildcard,
+
+    #[error("Given contract does not commit to asset '{0}'")]
+    InvalidContractForAsset(String),
+
+    #[error("Given transaction does not contain issuance of asset '{0}'")]
+    InvalidIssuanceTxtForAsset(String),
+
+    #[cfg(feature = "test_wallet")]
+    #[error(transparent)]
+    SignerError(#[from] lwk_signer::NewError),
+
+    #[error(transparent)]
+    RmpvDecodeError(#[from] rmpv::decode::Error),
+
+    #[error(transparent)]
+    RmpvEncodeError(#[from] rmpv::encode::Error),
+
+    #[error(transparent)]
+    RmpvExtError(#[from] rmpv::ext::Error),
+
+    #[error(transparent)]
+    RmpSerdeDecodeError(#[from] rmp_serde::decode::Error),
+
+    #[error(transparent)]
+    RmpSerdeEncodeError(#[from] rmp_serde::encode::Error),
+
+    #[cfg(feature = "amp0")]
+    #[error("Cannot generate address for AMP0 wallets using this call, use Amp0::address()")]
+    Amp0AddressError,
 }
 
 // cannot derive automatically with this error because of trait bound

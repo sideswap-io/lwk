@@ -6,22 +6,36 @@ use crate::store::Timestamp;
 use crate::{ElementsNetwork, Error};
 use elements::bitcoin;
 
-use lwk_common::burn_script;
+use lwk_common::{burn_script, SignedBalance};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::str::FromStr;
 
 /// Details of a wallet transaction output used in [`WalletTx`]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WalletTxOut {
+    /// The outpoint of the output.
     pub outpoint: OutPoint,
+
+    /// The script pubkey of the output.
     pub script_pubkey: Script,
+
+    /// The height of the block containing this output if it's confirmed.
     pub height: Option<u32>,
+
+    /// The unblinded values (amount and asset) of the output with their blinding factors.
     pub unblinded: TxOutSecrets,
+
+    /// The wildcard index of the address of this output.
     pub wildcard_index: u32,
+
+    /// The chain of the output. Can be "external" or "internal" (change).
     pub ext_int: Chain,
+
+    /// Whether the output is spent.
     pub is_spent: bool,
+
+    /// The address receiving this output.
     pub address: Address,
 }
 
@@ -51,14 +65,31 @@ pub struct ExternalUtxo {
 /// wallet.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WalletTx {
+    /// The transaction.
     pub tx: Transaction,
+
+    /// The transaction id.
     pub txid: Txid,
+
+    /// The height of the block containing the transaction if it's confirmed.
     pub height: Option<u32>,
-    pub balance: BTreeMap<AssetId, i64>,
+
+    /// The net balance from the perspective of the wallet of the transaction.
+    pub balance: SignedBalance,
+
+    /// The fee of the transaction.
     pub fee: u64,
+
+    /// The type of the transaction. Can be "issuance", "reissuance", "burn", "redeposit", "incoming", "outgoing" or "unknown".
     pub type_: String,
+
+    /// The timestamp of the transaction if it's confirmed.
     pub timestamp: Option<Timestamp>,
+
+    /// The inputs of the transaction that belong to this wallet, or None for inputs owned by others (thus respecting the indexes of the inputs).
     pub inputs: Vec<Option<WalletTxOut>>,
+
+    /// The outputs of the transaction that belong to this wallet, or None for outputs owned by others (thus respecting the indexes of the outputs).
     pub outputs: Vec<Option<WalletTxOut>>,
 }
 
@@ -68,13 +99,21 @@ pub struct WalletTx {
 /// network independent.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Recipient {
+    /// The amount to send in satoshi.
     pub satoshi: u64,
+
+    /// The script pubkey of the recipient.
     pub script_pubkey: Script,
+
+    /// The blinding pubkey of the recipient.
     pub blinding_pubkey: Option<PublicKey>,
+
+    /// The asset to send.
     pub asset: AssetId,
 }
 
 impl Recipient {
+    /// Create a new recipient from the given `satoshi`, `address` and `asset`.
     pub fn from_address(satoshi: u64, address: &Address, asset: AssetId) -> Self {
         Self {
             satoshi,
@@ -105,6 +144,7 @@ pub struct UnvalidatedRecipient {
 }
 
 impl UnvalidatedRecipient {
+    /// Create a new unvalidated recipient for receiving `satoshi` units of the policy asset (Liquid Bitcoin for mainnet).
     pub fn lbtc(address: String, satoshi: u64) -> Self {
         UnvalidatedRecipient {
             address,
@@ -112,6 +152,8 @@ impl UnvalidatedRecipient {
             asset: "".to_string(),
         }
     }
+
+    /// Create a new unvalidated recipient for burning `satoshi` units of the given `asset`.
     pub fn burn(asset: String, satoshi: u64) -> Self {
         UnvalidatedRecipient {
             address: "burn".to_string(),
@@ -160,6 +202,11 @@ impl UnvalidatedRecipient {
         Ok(self.satoshi)
     }
 
+    /// Validate fields of this UnvalidatedRecipient and return a validated one:
+    ///
+    /// * non zero amount
+    /// * valid asset id (64 hex characters)
+    /// * valid address for the given `network` (or translate "burn" to a burn script)
     pub fn validate(&self, network: ElementsNetwork) -> Result<Recipient, Error> {
         let satoshi = self.validate_satoshi()?;
         let asset = self.validate_asset(network)?;
@@ -187,14 +234,17 @@ pub struct AddressResult {
 }
 
 impl AddressResult {
+    /// Create a new address result.
     pub fn new(address: Address, index: u32) -> Self {
         Self { address, index }
     }
 
+    /// Get the address.
     pub fn address(&self) -> &Address {
         &self.address
     }
 
+    /// Get the derivation index of this address, the last element in the derivation path. In standard with-wildcard descriptors is the value replacing the wildcard.
     pub fn index(&self) -> u32 {
         self.index
     }
@@ -228,13 +278,28 @@ impl BitcoinAddressResult {
 /// Value returned from [`crate::Wollet::issuance()`] containing details about an issuance
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct IssuanceDetails {
+    /// Transaction id containing the issuance
     pub txid: Txid,
+
+    /// Input index containing the issuance
     pub vin: u32,
+
+    /// Entropy of the issuance
     pub entropy: [u8; 32],
+
+    /// Asset id of the asset emitted
     pub asset: AssetId,
+
+    /// Asset id of the reissuance token
     pub token: AssetId,
+
+    /// Amount of asset emitted
     pub asset_amount: Option<u64>,
+
+    /// Amount of reissuance token emitted
     pub token_amount: Option<u64>,
+
+    /// Whether the issuance is a reissuance
     pub is_reissuance: bool,
     // asset_blinder
     // token_blinder
@@ -280,6 +345,7 @@ impl std::fmt::Display for DisplayWalletTxInputOutputs<'_> {
 }
 
 impl WalletTx {
+    /// Generate the URL to the transaction on the given explorer including the information needed to unblind the transaction in the explorer UI.
     pub fn unblinded_url(&self, explorer_url: &str) -> String {
         format!(
             "{}tx/{}#blinded={}",

@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![warn(missing_docs)]
 
 //! A crate containing common code used in multiple other crate in the workspace, such as:
 //!
@@ -9,6 +10,8 @@
 //!
 //!  To avoid circular dependencies this crate must not depend on other crate of the workspace
 
+mod address;
+mod balance;
 mod descriptor;
 mod error;
 mod keyorigin_xpub;
@@ -19,6 +22,8 @@ mod qr;
 mod segwit;
 mod signer;
 
+pub use crate::address::{Address, AddressParseError};
+pub use crate::balance::{Balance, SignedBalance};
 pub use crate::descriptor::{
     multisig_desc, singlesig_desc, Bip, DescriptorBlindingKey, InvalidBipVariant,
     InvalidBlindingKeyVariant, InvalidMultisigVariant, InvalidSinglesigVariant, Multisig,
@@ -31,7 +36,21 @@ pub use crate::network::Network;
 pub use crate::precision::Precision;
 pub use crate::qr::*;
 pub use crate::segwit::is_provably_segwit;
+#[cfg(feature = "amp0")]
+pub use crate::signer::amp0::{Amp0Signer, Amp0SignerData};
 pub use crate::signer::Signer;
+
+/// A trait for async read/write operations used by hardware wallet connections
+pub trait Stream {
+    /// The error type returned by read and write operations
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Read data from the stream into the provided buffer
+    fn read(&self, buf: &mut [u8])
+        -> impl std::future::Future<Output = Result<usize, Self::Error>>;
+    /// Write data to the stream
+    fn write(&self, data: &[u8]) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+}
 
 use elements::confidential::{Asset, Value};
 use elements_miniscript::confidential::bare::tweak_private_key;
@@ -49,11 +68,15 @@ use elements_miniscript::elements::{
 use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use std::collections::btree_map::BTreeMap;
 
+/// The sockets of the Blockstream Liquid Electrum servers.
 pub mod electrum_ssl {
+    /// The socket of the Blockstream Liquid mainnet Electrum server.
     pub const LIQUID_SOCKET: &str = "elements-mainnet.blockstream.info:50002";
+    /// The socket of the Blockstream Liquid testnet Electrum server.
     pub const LIQUID_TESTNET_SOCKET: &str = "elements-testnet.blockstream.info:50002";
 }
 
+/// Derive the script pubkey from a confidential descriptor and an index.
 pub fn derive_script_pubkey(
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
     index: u32,
@@ -64,6 +87,7 @@ pub fn derive_script_pubkey(
         .script_pubkey())
 }
 
+/// Derive the blinding secret key from a confidential descriptor and a script pubkey.
 pub fn derive_blinding_key(
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
     script_pubkey: &Script,
@@ -125,6 +149,8 @@ fn is_mine(
     Ok(false)
 }
 
+/// Return the net balance of a PSET from the perspective of the given `descriptor`.
+/// It returns also the fee and the recipients (external receivers) of the PSET.
 pub fn pset_balance(
     pset: &PartiallySignedTransaction,
     descriptor: &ConfidentialDescriptor<DescriptorPublicKey>,
@@ -214,10 +240,9 @@ pub fn pset_balance(
 
         if !is_mine(&output.script_pubkey, descriptor, &output.bip32_derivation).unwrap_or(false) {
             // external recipients
-
-            let address = output.blinding_key.as_ref().and_then(|k| {
-                elements::Address::from_script(&output.script_pubkey, Some(k.inner), params)
-            });
+            let blinding_pubkey = output.blinding_key.as_ref().map(|k| k.inner);
+            let address =
+                elements::Address::from_script(&output.script_pubkey, blinding_pubkey, params);
             let recipient = Recipient {
                 address,
                 vout: idx as u32,
@@ -286,11 +311,13 @@ pub fn pset_balance(
 
     Ok(PsetBalance {
         fee,
-        balances,
+        balances: balances.into(),
         recipients,
     })
 }
 
+/// Return the signatures of a PSET, for each input return a [`PsetSignatures`] which includes a
+/// list of signatures that are available and a list of signatures that are missing.
 pub fn pset_signatures(pset: &PartiallySignedTransaction) -> Vec<PsetSignatures> {
     pset.inputs()
         .iter()
@@ -312,6 +339,7 @@ pub fn pset_signatures(pset: &PartiallySignedTransaction) -> Vec<PsetSignatures>
         .collect()
 }
 
+/// Return the issuances of a PSET, for each input return an Issuance but the struct must be checked with [`Issuance::is_issuance`] if it's a real issuance or reissuance.
 pub fn pset_issuances(pset: &PartiallySignedTransaction) -> Vec<Issuance> {
     pset.inputs().iter().map(Issuance::new).collect()
 }
@@ -321,6 +349,7 @@ pub fn burn_script() -> Script {
     Builder::new().push_opcode(OP_RETURN).into_script()
 }
 
+/// Create a debug string of a PSET, but remove new lines on number arrays.
 pub fn pset_debug(pset: &PartiallySignedTransaction) -> String {
     let debug_str = format!("{:#?}", pset);
     let mut result = String::new();

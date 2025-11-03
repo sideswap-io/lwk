@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
+mod amp0;
 mod amp2;
 pub mod blockdata;
 mod chain;
@@ -24,8 +26,18 @@ pub mod types;
 mod update;
 mod wollet;
 
+#[cfg(feature = "lightning")]
+mod invoice;
+#[cfg(feature = "lightning")]
+mod lightning;
+#[cfg(feature = "lightning")]
+pub use invoice::{Bolt11Invoice, LightningPayment};
+#[cfg(feature = "lightning")]
+pub use lightning::{LightningSession, LogLevel, Logging, LoggingLink};
+
 pub use blockdata::address::Address;
 pub use blockdata::address_result::AddressResult;
+pub use blockdata::block_header::BlockHeader;
 pub use blockdata::external_utxo::ExternalUtxo;
 pub use blockdata::out_point::OutPoint;
 pub use blockdata::script::Script;
@@ -44,7 +56,7 @@ pub use chain::Chain;
 pub use desc::WolletDescriptor;
 pub use electrum_client::ElectrumClient;
 pub use error::LwkError;
-pub use esplora_client::EsploraClient;
+pub use esplora_client::{EsploraClient, EsploraClientBuilder};
 pub use liquidex::{AssetAmount, UnvalidatedLiquidexProposal, ValidatedLiquidexProposal};
 pub use mnemonic::Mnemonic;
 pub use network::Network;
@@ -52,7 +64,7 @@ pub use persister::{ForeignPersister, ForeignPersisterLink};
 pub use precision::Precision;
 pub use pset::{Pset, PsetInput};
 pub use pset_details::{Issuance, PsetDetails};
-pub use test_env::TestEnv;
+pub use test_env::LwkTestEnv;
 pub use tx_builder::TxBuilder;
 pub use update::Update;
 

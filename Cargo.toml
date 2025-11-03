@@ -15,6 +15,7 @@ members = [
     "lwk_rpc_model",
     "lwk_test_util",
     "lwk_wasm",
+    "lwk_boltz",
 ]
 resolver = "2"
 
@@ -29,6 +30,7 @@ lwk_signer = { path = "lwk_signer" }
 lwk_test_util = { path = "lwk_test_util" }
 lwk_tiny_jrpc = { path = "lwk_tiny_jrpc" }
 lwk_wollet = { path = "lwk_wollet" }
+lwk_boltz = { path = "lwk_boltz" }
 
 [profile.release-smaller]
 inherits = "release"
@@ -38,5 +40,10 @@ codegen-units = 1    # Reduce number of codegen units to increase optimizations.
 panic = "abort"      # Abort on panic
 strip = "debuginfo"  # Partially strip symbols from binary
 
-[workspace.dependencies]
-log = "0.4.22"
+[profile.release-with-debug]
+inherits = "release"
+debug = true         # Include debug symbols for profiling
+strip = "none"       # Don't strip any symbols
+
+# [workspace.dependencies] # This cause issues in publishing single crates with our current flow
+# log = "0.4.22"

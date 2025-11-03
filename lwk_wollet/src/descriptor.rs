@@ -1,5 +1,6 @@
 use std::{fmt::Display, str::FromStr};
 
+#[allow(deprecated)]
 use aes_gcm_siv::aead::generic_array::GenericArray;
 use aes_gcm_siv::Aes256GcmSiv;
 use aes_gcm_siv::KeyInit;
@@ -15,7 +16,7 @@ use elements_miniscript::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::EC;
+use crate::{Error, EC};
 
 sha256t_hash_newtype! {
     /// The tag of the hash
@@ -28,22 +29,66 @@ sha256t_hash_newtype! {
 
 #[derive(Debug, Clone)]
 /// A wrapper that contains only the subset of CT descriptors handled by wollet
-pub struct WolletDescriptor(pub ConfidentialDescriptor<DescriptorPublicKey>);
+pub struct WolletDescriptor {
+    inner: ConfidentialDescriptor<DescriptorPublicKey>,
+    #[cfg(feature = "amp0")]
+    is_amp0: bool,
+}
 
 impl Display for WolletDescriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.0, f)
+        Display::fmt(&self.inner, f)
     }
 }
 
 impl std::hash::Hash for WolletDescriptor {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_string().hash(state);
+        self.inner.to_string().hash(state);
     }
 }
 
+#[cfg(feature = "amp0")]
+fn desc_is_amp0(desc: &ConfidentialDescriptor<DescriptorPublicKey>) -> bool {
+    use crate::amp0;
+    use elements_miniscript::descriptor::{ShInner, Wildcard, WshInner};
+    use elements_miniscript::miniscript::decode::Terminal;
+
+    // ct(slip77(...),elsh(wsh(multi(2,server_xpub,user_xpub))))
+    if let Key::Slip77(_) = desc.key {
+        if let Descriptor::Sh(sh) = &desc.descriptor {
+            if let ShInner::Wsh(wsh) = sh.as_inner() {
+                if let WshInner::Ms(ms) = wsh.as_inner() {
+                    if let Terminal::Multi(2, pks) = &ms.node {
+                        if let [DescriptorPublicKey::XPub(xkey), _] = &pks[..] {
+                            // server xpub [fp/3/gaitpath/amp_subaccount]xpub/*
+                            // user xpub   [fp/3'/amp_subaccount']xpub/* (not checked)
+                            if xkey.wildcard == Wildcard::Unhardened
+                                && xkey.derivation_path.is_empty()
+                            {
+                                if let Some((fingerprint, server_path)) = &xkey.origin {
+                                    let fp = fingerprint.to_string();
+                                    let cn = ChildNumber::Normal { index: 3 };
+                                    if server_path.len() == 34
+                                        && server_path[0] == cn
+                                        && (fp == amp0::AMP0_FINGERPRINT_MAINNET
+                                            || fp == amp0::AMP0_FINGERPRINT_TESTNET
+                                            || fp == amp0::AMP0_FINGERPRINT_REGTEST)
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 impl TryFrom<ConfidentialDescriptor<DescriptorPublicKey>> for WolletDescriptor {
-    type Error = crate::error::Error;
+    type Error = Error;
 
     fn try_from(desc: ConfidentialDescriptor<DescriptorPublicKey>) -> Result<Self, Self::Error> {
         if let Key::Bare(_) = &desc.key {
@@ -80,22 +125,33 @@ impl TryFrom<ConfidentialDescriptor<DescriptorPublicKey>> for WolletDescriptor {
             }
         }
 
+        #[cfg(feature = "amp0")]
+        let is_amp0 = desc_is_amp0(&desc);
+
         // Support legacy p2sh multisig
         if let elements_miniscript::descriptor::DescriptorType::Sh = desc.descriptor.desc_type() {
             if desc.descriptor.to_string().starts_with("elsh(multi(") {
-                return Ok(WolletDescriptor(desc));
+                return Ok(WolletDescriptor {
+                    inner: desc,
+                    #[cfg(feature = "amp0")]
+                    is_amp0,
+                });
             }
         }
 
         match desc.descriptor.desc_type().segwit_version() {
-            Some(WitnessVersion::V0) => Ok(WolletDescriptor(desc)),
+            Some(WitnessVersion::V0) => Ok(WolletDescriptor {
+                inner: desc,
+                #[cfg(feature = "amp0")]
+                is_amp0,
+            }),
             _ => Err(Self::Error::UnsupportedDescriptorNonV0),
         }
     }
 }
 
 impl FromStr for WolletDescriptor {
-    type Err = crate::error::Error;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ConfidentialDescriptor::<DescriptorPublicKey>::from_str(s)?.try_into()
@@ -118,10 +174,17 @@ impl TryFrom<&Descriptor<DescriptorPublicKey>> for Chain {
 
     fn try_from(value: &Descriptor<DescriptorPublicKey>) -> Result<Self, Self::Error> {
         let mut ext_int = None;
-        // can keys have different derivation path???
+        // TODO: error if multiple keys have different derivation path
+
+        let has_wildcard = value.has_wildcard();
+
         value.for_each_key(|k| {
             if let Some(path) = k.full_derivation_path() {
-                ext_int = path.into_iter().last().cloned();
+                if has_wildcard {
+                    ext_int = path.into_iter().last().cloned();
+                } else {
+                    ext_int = path.into_iter().nth_back(1).cloned();
+                }
             }
             false
         });
@@ -152,8 +215,14 @@ impl TryFrom<&ConfidentialDescriptor<DescriptorPublicKey>> for Chain {
 }
 
 impl WolletDescriptor {
+    /// Return a reference to the underlying descriptor.
     pub fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
-        &self.0.descriptor
+        &self.inner.descriptor
+    }
+
+    /// Return the descriptor URL encoded to be used as part of an URL
+    pub fn url_encoded_descriptor(&self) -> String {
+        url_encode_descriptor(&self.inner.to_string())
     }
 
     /// Return a deterministic wallet identifier (DWID).
@@ -166,7 +235,7 @@ impl WolletDescriptor {
     ///
     /// On regtest and testnet you can have exactly the same descriptor, by accepting the network we create different identifiers for these networks.
     /// This is done also to create different identifiers on custom networks.
-    pub fn dwid(&self, network: lwk_common::Network) -> Result<String, crate::error::Error> {
+    pub fn dwid(&self, network: lwk_common::Network) -> Result<String, Error> {
         let index = (1 << 31) - 1; // 2^31 - 1
 
         // Use the Elements network address parameters
@@ -193,8 +262,8 @@ impl WolletDescriptor {
 
     /// Return wether the descriptor has a blinding key derived with [Elip151](https://github.com/ElementsProject/ELIPs/blob/main/elip-0151.mediawiki)
     pub fn is_elip151(&self) -> bool {
-        if let Ok(elip151_key) = Key::from_elip151(&self.0.descriptor) {
-            elip151_key == self.0.key
+        if let Ok(elip151_key) = Key::from_elip151(&self.inner.descriptor) {
+            elip151_key == self.inner.key
         } else {
             false
         }
@@ -202,7 +271,7 @@ impl WolletDescriptor {
 
     /// Strip key origin information from the bitcoin descriptor and return it without checksum
     pub fn bitcoin_descriptor_without_key_origin(&self) -> String {
-        let desc = self.0.descriptor.to_string();
+        let desc = self.inner.descriptor.to_string();
         let mut result = String::with_capacity(desc.len());
         let mut skip = false;
         for c in desc.chars() {
@@ -223,7 +292,7 @@ impl WolletDescriptor {
     /// external descriptor accordint to `int_or_ext`
     fn inner_descriptor_if_available(&self, ext_int: Chain) -> WolletDescriptor {
         let mut descriptors = self
-            .0
+            .inner
             .descriptor
             .clone()
             .into_single_descriptors()
@@ -237,17 +306,24 @@ impl WolletDescriptor {
                 Chain::Internal => descriptors.remove(1),
             }
         };
-        WolletDescriptor(ConfidentialDescriptor {
-            key: self.0.key.clone(),
+        let inner = ConfidentialDescriptor {
+            key: self.inner.key.clone(),
             descriptor,
-        })
+        };
+        WolletDescriptor {
+            inner,
+            #[cfg(feature = "amp0")]
+            is_amp0: self.is_amp0,
+        }
     }
 
+    /// Derive the single path descriptors of this descriptor if it's multipath.
+    /// If it's not multipath, return the descriptor itself as a single element.
     pub fn single_bitcoin_descriptors(&self) -> Vec<String> {
         let d = self.inner_descriptor_if_available(Chain::External);
         let d = to_bitcoin_descriptor(&d.descriptor().to_string());
         let mut v = vec![d];
-        if self.0.descriptor.is_multipath() {
+        if self.inner.descriptor.is_multipath() {
             let d = self.inner_descriptor_if_available(Chain::Internal);
             let d = to_bitcoin_descriptor(&d.descriptor().to_string());
             v.push(d);
@@ -255,44 +331,59 @@ impl WolletDescriptor {
         v
     }
 
-    pub fn change(
-        &self,
-        index: u32,
-        params: &'static AddressParams,
-    ) -> Result<Address, crate::error::Error> {
+    /// Derive a change address from this descriptor at the given `index`.
+    pub fn change(&self, index: u32, params: &'static AddressParams) -> Result<Address, Error> {
         self.inner_address(index, params, Chain::Internal)
     }
 
+    /// Get a cipher from the descriptor, used to encrypt and decrypt updates.
+    ///
+    /// The rationale to derive a key from the descriptor is to avoid storing a separate key that you need to backup for the wallet data.
+    /// In the end the descriptor allows you to recover the same data directly from the blockchain, thus we don't need additional security.
+    #[allow(deprecated)]
     pub fn cipher(&self) -> Aes256GcmSiv {
         let key_bytes = EncryptionKeyHash::hash(self.to_string().as_bytes()).to_byte_array();
         let key = GenericArray::from_slice(&key_bytes);
         Aes256GcmSiv::new(key)
     }
 
-    pub fn address(
-        &self,
-        index: u32,
-        params: &'static AddressParams,
-    ) -> Result<Address, crate::error::Error> {
+    /// Derive an address from this descriptor at the given `index`.
+    pub fn address(&self, index: u32, params: &'static AddressParams) -> Result<Address, Error> {
         self.inner_address(index, params, Chain::External)
     }
 
-    pub(crate) fn inner_address(
+    fn inner_address(
         &self,
         index: u32,
         params: &'static AddressParams,
         ext_int: Chain,
-    ) -> Result<Address, crate::error::Error> {
+    ) -> Result<Address, Error> {
+        #[cfg(feature = "amp0")]
+        if self.is_amp0 {
+            return Err(Error::Amp0AddressError);
+        }
         Ok(self
             .inner_descriptor_if_available(ext_int)
-            .0
+            .inner
             .at_derivation_index(index)?
-            .address(&crate::EC, params)?)
+            .address(&EC, params)?)
+    }
+
+    #[cfg(feature = "amp0")]
+    pub(crate) fn amp0_address(
+        &self,
+        index: u32,
+        params: &'static AddressParams,
+    ) -> Result<Address, Error> {
+        Ok(self
+            .inner
+            .at_derivation_index(index)?
+            .address(&EC, params)?)
     }
 
     /// Get a scriptpubkey
-    pub fn script_pubkey(&self, ext_int: Chain, index: u32) -> Result<Script, crate::error::Error> {
-        let v = self.0.descriptor.clone().into_single_descriptors()?;
+    pub fn script_pubkey(&self, ext_int: Chain, index: u32) -> Result<Script, Error> {
+        let v = self.inner.descriptor.clone().into_single_descriptors()?;
         let d = match ext_int {
             Chain::External => v.first().expect("at least on descriptor"),
             Chain::Internal => v.last().expect("at least on descriptor"),
@@ -305,7 +396,7 @@ impl WolletDescriptor {
         &self,
         ext_int: Chain,
         index: u32,
-    ) -> Result<Descriptor<DefiniteDescriptorKey>, crate::Error> {
+    ) -> Result<Descriptor<DefiniteDescriptorKey>, Error> {
         let desc = self.inner_descriptor_if_available(ext_int);
         Ok(desc.descriptor().at_derivation_index(index)?)
     }
@@ -315,16 +406,16 @@ impl WolletDescriptor {
         &self,
         ext_int: Chain,
         index: u32,
-    ) -> Result<ConfidentialDescriptor<DefiniteDescriptorKey>, crate::Error> {
+    ) -> Result<ConfidentialDescriptor<DefiniteDescriptorKey>, Error> {
         Ok(self
             .inner_descriptor_if_available(ext_int)
-            .0
+            .inner
             .at_derivation_index(index)?)
     }
 
     /// Try also to parse it as a non-multipath descriptor specified on 2 lines,
     /// like the format exported by the Green Wallet
-    pub fn from_str_relaxed(desc: &str) -> Result<WolletDescriptor, crate::Error> {
+    pub fn from_str_relaxed(desc: &str) -> Result<WolletDescriptor, Error> {
         match WolletDescriptor::from_str(desc) {
             Ok(d) => Ok(d),
             Err(e) => parse_multiline(desc).ok_or(e),
@@ -348,7 +439,7 @@ impl WolletDescriptor {
         index: u32,
         network: bitcoin::Network,
         fed_desc: BtcDescriptor<bitcoin::PublicKey>,
-    ) -> Result<bitcoin::Address, crate::error::Error> {
+    ) -> Result<bitcoin::Address, Error> {
         let our_desc = self
             .definite_descriptor(Chain::External, index)?
             .derived_descriptor(&EC)?;
@@ -360,16 +451,39 @@ impl WolletDescriptor {
 
     pub(crate) fn as_single_descriptors(
         &self,
-    ) -> Result<Vec<ConfidentialDescriptor<DescriptorPublicKey>>, crate::Error> {
-        let descriptors = self.0.descriptor.clone().into_single_descriptors()?;
+    ) -> Result<Vec<ConfidentialDescriptor<DescriptorPublicKey>>, Error> {
+        let descriptors = self.inner.descriptor.clone().into_single_descriptors()?;
         let mut result = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors {
             result.push(ConfidentialDescriptor {
-                key: self.0.key.clone(),
+                key: self.inner.key.clone(),
                 descriptor,
             });
         }
         Ok(result)
+    }
+
+    /// Whether this descriptor has a wildcard. A descriptor without a wildcard is a single address descriptor.
+    pub fn has_wildcard(&self) -> bool {
+        self.inner.descriptor.has_wildcard()
+    }
+
+    /// Whether this descriptor is a AMP0 descriptor
+    #[cfg(feature = "amp0")]
+    pub fn is_amp0(&self) -> bool {
+        self.is_amp0
+    }
+
+    /// Mark the descriptor as not AMP0
+    ///
+    /// Calling this function improperly might lead to loss of funds.
+    /// Do not call this function unless you know what you are doing.
+    ///
+    /// The chance that someone will actually need this function is
+    /// extremely unlikely.
+    #[cfg(feature = "amp0")]
+    pub fn dangerous_this_wallet_is_not_amp0(&mut self) {
+        self.is_amp0 = false;
     }
 }
 
@@ -410,8 +524,35 @@ fn to_bitcoin_descriptor(s: &str) -> String {
 
 impl AsRef<ConfidentialDescriptor<DescriptorPublicKey>> for WolletDescriptor {
     fn as_ref(&self) -> &ConfidentialDescriptor<DescriptorPublicKey> {
-        &self.0
+        &self.inner
     }
+}
+
+/// Simple URL encoding for common characters found in Bitcoin descriptors
+pub(crate) fn url_encode_descriptor(desc: &str) -> String {
+    desc.chars()
+        .map(|c| match c {
+            '(' => "%28".to_string(),
+            ')' => "%29".to_string(),
+            '[' => "%5B".to_string(),
+            ']' => "%5D".to_string(),
+            '{' => "%7B".to_string(),
+            '}' => "%7D".to_string(),
+            '/' => "%2F".to_string(),
+            '*' => "%2A".to_string(),
+            ',' => "%2C".to_string(),
+            '%' => "%25".to_string(),
+            '&' => "%26".to_string(),
+            '#' => "%23".to_string(),
+            '+' => "%2B".to_string(),
+            '\'' => "%27".to_string(),
+            '<' => "%3C".to_string(),
+            '>' => "%3E".to_string(),
+            ';' => "%3B".to_string(),
+            ' ' => "%20".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -425,7 +566,81 @@ mod test {
     use elements::bitcoin;
     use elements_miniscript::{BtcDescriptor, BtcMiniscript, BtcSegwitv0};
 
-    use crate::{descriptor::remove_checksum_if_any, Chain, WolletDescriptor, EC};
+    use crate::{
+        descriptor::{remove_checksum_if_any, url_encode_descriptor},
+        Chain, WolletDescriptor, EC,
+    };
+
+    #[track_caller]
+    fn chain(desc: &str, expected: Option<Chain>) {
+        let wallet_desc = WolletDescriptor::from_str(desc).unwrap();
+        let desc = wallet_desc.descriptor();
+        let chain = Chain::try_from(desc);
+        match expected {
+            Some(expected) => assert_eq!(chain.unwrap(), expected),
+            None => assert!(chain.is_err()),
+        };
+    }
+
+    #[test]
+    fn test_url_encode_descriptor() {
+        // Test basic descriptor encoding
+        let desc = "ct(slip77(key),elwpkh(xpub/*))";
+        let encoded = url_encode_descriptor(desc);
+        assert_eq!(encoded, "ct%28slip77%28key%29%2Celwpkh%28xpub%2F%2A%29%29");
+
+        // Test descriptor with brackets
+        let desc_with_brackets = "ct(key,elwpkh([fingerprint/path]xpub/*))";
+        let encoded_brackets = url_encode_descriptor(desc_with_brackets);
+        assert_eq!(
+            encoded_brackets,
+            "ct%28key%2Celwpkh%28%5Bfingerprint%2Fpath%5Dxpub%2F%2A%29%29"
+        );
+
+        // Test descriptor with curly braces
+        let desc_with_braces = "ct({key},elwpkh(xpub/*))";
+        let encoded_braces = url_encode_descriptor(desc_with_braces);
+        assert_eq!(encoded_braces, "ct%28%7Bkey%7D%2Celwpkh%28xpub%2F%2A%29%29");
+
+        // Test descriptor with multipath syntax
+        let desc_with_multipath = "ct(key,elwpkh(xpub/<0;1>/*))";
+        let encoded_multipath = url_encode_descriptor(desc_with_multipath);
+        assert_eq!(
+            encoded_multipath,
+            "ct%28key%2Celwpkh%28xpub%2F%3C0%3B1%3E%2F%2A%29%29"
+        );
+
+        // Test normal characters (should remain unchanged)
+        let normal = "ctabc123def";
+        assert_eq!(url_encode_descriptor(normal), "ctabc123def");
+    }
+
+    #[test]
+    fn test_chain_from_descriptor() {
+        let blinding = "slip77(ab5824f4477b4ebb00a132adfd8eb0b7935cf24f6ac151add5d1913db374ce92)";
+        let base = "elwpkh([759db348/84'/1'/0']tpubDCRMaF33e44pcJj534LXVhFbHibPbJ5vuLhSSPFAw57kYURv4tzXFL6LSnd78bkjqdmE3USedkbpXJUPA1tdzKfuYSL7PianceqAhwL2UkA";
+
+        let desc_multi = format!("ct({blinding},{base}/<0;1>/*))");
+        chain(&desc_multi, None);
+
+        let desc_single = format!("ct({blinding},{base}/0/*))");
+        chain(&desc_single, Some(Chain::External));
+
+        let desc_single_internal = format!("ct({blinding},{base}/1/*))");
+        chain(&desc_single_internal, Some(Chain::Internal));
+
+        let desc_single_internal = format!("ct({blinding},{base}/2/*))");
+        chain(&desc_single_internal, None);
+
+        let desc_no_wildcard = format!("ct({blinding},{base}/0/506))");
+        chain(&desc_no_wildcard, Some(Chain::External));
+
+        let desc_no_wildcard = format!("ct({blinding},{base}/1/506))");
+        chain(&desc_no_wildcard, Some(Chain::Internal));
+
+        let desc_no_wildcard = format!("ct({blinding},{base}/2/506))");
+        chain(&desc_no_wildcard, None);
+    }
 
     #[test]
     fn test_wollet_hash() {
@@ -718,5 +933,40 @@ mod test {
             unconfidential_address.to_string(),
             expected_address.to_string()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "amp0")]
+    fn test_wollet_desc_amp0() {
+        let desc_singlesig = "ct(elip151,elwpkh([28b3f14e/84'/1'/0']tpubDC2Q4xK4XH72GM7MowNuajyWVbigRLBWKswyP5T88hpPwu5nGqJWnda8zhJEFt71av73Hm8mUMMFSz9acNVzz8b1UbdSHCDXKTbSv5eEytu/<0;1>/*))";
+        let desc_amp0_testnet = "ct(slip77(64321fcf13c2d181ef890ecaf05e973141aa1805949f566232ea52519b35049f),elsh(wsh(multi(2,[98c379b9/3/64185/12352/25274/48669/37222/21152/54418/37839/49229/51085/38856/63304/40878/27010/17469/34767/52063/13856/53616/54101/58845/33548/844/33726/37617/30217/7805/42254/15959/37011/41009/10546/1]tpubECTFwsAEJdFtrfRn1tj2MGXSWa8Ten6JLhr9wYm9w7Fam8CR3w8z9Lfr3HbWmBYArciw7tDYBafjzBjy56CrebLhFAvpjFu7UJjotAChVse/*,[a803afe3/3'/1']tpubDA9GDAo3JyS2TTixDwx3w6bwZBTani1wvBvh5ckjR7PAyvUGvd7z8sHYtd9wh23ExhUqq3F3p3tgJr68LVJK2fkdqmdhxjeSWy8oP261Q1y/1/*))))#emhdrkmv";
+        let desc_amp0_mainnet = "ct(slip77(6f9d2dca0d56955cacf89586073ce9db19d46c91533e3222abf10eb46bf8337f),elsh(wsh(multi(2,[0557d83a/3/54195/32530/57583/38568/49379/35784/9512/56310/17245/6737/43041/17998/50002/15170/64436/22872/25420/4993/30612/9196/10098/19/41830/57717/13566/31903/7184/42492/46291/9903/31188/21509/1]xpub7CYN5ZJe3XmqhmNJJJSHP6d36LjKxbKJLNQovGo4wVYSYa4pabxQS2uRMSmzXVC6yD4vaWZGYaq6CuEbc4WPaBRpYYTjHW9BwEjEzn9E4uu/*,[88b6fd7e/3'/1']xpub69mdgvyMbhUaDRbrobUCqAGn9WAWcxKt2oMUxT15EisxCgMAL3CcazyBwPrP7MudQcPbN7VXDyrNQo1pbW1HDhUCzoeJU3giZ2w8crfPe6C/1/*))))#c0c40fkx";
+
+        let wd_singlesig = WolletDescriptor::from_str(desc_singlesig).unwrap();
+        let wd_amp0_test = WolletDescriptor::from_str(desc_amp0_testnet).unwrap();
+        let wd_amp0_main = WolletDescriptor::from_str(desc_amp0_mainnet).unwrap();
+
+        assert!(!wd_singlesig.is_amp0());
+        assert!(wd_amp0_test.is_amp0());
+        assert!(wd_amp0_main.is_amp0());
+
+        let params = &elements::AddressParams::ELEMENTS;
+        let expected_err =
+            "Cannot generate address for AMP0 wallets using this call, use Amp0::address()";
+        let err = wd_amp0_test.address(1, params).unwrap_err();
+        assert_eq!(err.to_string(), expected_err);
+        let err = wd_amp0_main.address(1, params).unwrap_err();
+        assert_eq!(err.to_string(), expected_err);
+
+        // For AMP0 Wollet::address() fails too
+        use crate::{ElementsNetwork, Wollet};
+        let w_amp0_test =
+            Wollet::without_persist(ElementsNetwork::LiquidTestnet, wd_amp0_test).unwrap();
+        let w_amp0_main = Wollet::without_persist(ElementsNetwork::Liquid, wd_amp0_main).unwrap();
+
+        let err = w_amp0_test.address(Some(1)).unwrap_err();
+        assert_eq!(err.to_string(), expected_err);
+        let err = w_amp0_main.address(Some(1)).unwrap_err();
+        assert_eq!(err.to_string(), expected_err);
     }
 }

@@ -1,0 +1,69 @@
+# Regtest environment management
+set dotenv-load := true
+
+# Export environment variables for tests
+export-env-vars: regtest-env-start
+    #!/usr/bin/env bash
+    set -e
+    BITCOIND_COOKIE=$(cat regtest/data/bitcoind/regtest/.cookie)
+    LND_MACAROON_HEX=$(python3 -c 'import sys; print(open(sys.argv[1], "rb").read().hex())' regtest/data/lnd1/data/chain/bitcoin/regtest/admin.macaroon)
+    echo "BITCOIND_COOKIE=$BITCOIND_COOKIE" > .env
+    echo "LND_MACAROON_HEX=$LND_MACAROON_HEX" >> .env
+
+# Start the regtest environment
+regtest-env-start:
+    #!/usr/bin/env bash
+    set -e
+    cd regtest
+    ./start.sh
+    cd ../proxy
+    docker compose up -d
+    sleep 5
+
+regtest-env-stop:
+    #!/usr/bin/env bash
+    set -e
+    cd regtest
+    ./stop.sh
+    cd ../proxy
+    docker compose down
+    # Clean up sensitive environment variables
+    rm -f ../.env
+
+# Run reverse swap test
+test-reverse: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test reverse -- tests::test_session_reverse --nocapture --exact --ignored
+
+# Run submarine swap test
+test-submarine: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test submarine -- tests::test_session_submarine --nocapture --exact --ignored
+
+# Run submarine swap test with magic routing hints
+test-mrh: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test mrh -- test_session_mrh --nocapture --ignored
+
+# Run submarine restore swap test
+test-submarine-restore: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test submarine -- test_session_restore_submarine --nocapture --ignored
+
+
+# Run reverse restore swap test
+test-reverse-restore: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test reverse -- test_session_restore_reverse --nocapture --ignored
+
+
+# Run reverse swap test
+test-reverse-concurrent: export-env-vars
+    #!/usr/bin/env bash
+    set -e
+    RUST_LOG=info cargo test --test reverse -- test_session_reverse_concurrent --nocapture --ignored

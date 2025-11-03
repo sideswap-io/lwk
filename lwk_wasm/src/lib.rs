@@ -1,7 +1,12 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(all(feature = "serial", target_arch = "wasm32"))]
+mod amp0;
+
 mod amp2;
+mod balance;
 mod bip;
 mod blockdata;
 mod contract;
@@ -26,13 +31,21 @@ mod serial;
 mod signer;
 mod tx_builder;
 mod update;
+
+// TODO serial is not logically needed here, but it brings in web_sys dep
+#[cfg(all(feature = "serial", target_arch = "wasm32"))]
+mod websocket;
+
 mod wollet;
 mod xpub;
 
+#[cfg(all(feature = "serial", target_arch = "wasm32"))]
+pub use amp0::{Amp0, Amp0Pset};
 pub use amp2::{Amp2, Amp2Descriptor};
+pub use balance::Balance;
 pub use bip::Bip;
 pub use blockdata::address::{Address, AddressResult};
-pub use blockdata::asset_id::AssetId;
+pub use blockdata::asset_id::{AssetId, AssetIds};
 pub use blockdata::out_point::OutPoint;
 pub use blockdata::script::Script;
 pub use blockdata::transaction::{Transaction, Txid};
@@ -56,6 +69,10 @@ pub use registry::{AssetMeta, Registry, RegistryPost};
 pub use signer::Signer;
 pub use tx_builder::TxBuilder;
 pub use update::Update;
+
+#[cfg(all(feature = "serial", target_arch = "wasm32"))]
+pub use websocket::WebSocketSerial;
+
 pub use wollet::Wollet;
 pub use xpub::Xpub;
 
@@ -93,7 +110,7 @@ mod tests {
         let mut wollet = Wollet::new(&network, &descriptor).unwrap();
         let update = client.full_scan(&wollet).await.unwrap().unwrap();
         wollet.apply_update(&update).unwrap();
-        let balance = wollet.balance().unwrap();
+        let balance = wollet.balance().unwrap().entries().unwrap();
         let balance: HashMap<AssetId, u64> = serde_wasm_bindgen::from_value(balance).unwrap();
         assert!(
             *balance.get(&(network.policy_asset().into())).unwrap() >= expected_at_least,
@@ -104,7 +121,6 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_data() {
         let network = Network::testnet();
-        let mut client = network.default_esplora_client();
 
         let mnemonic = crate::Mnemonic::new(include_str!(
             "../test_data/update_with_mnemonic/mnemonic.txt"

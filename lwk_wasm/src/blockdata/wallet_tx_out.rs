@@ -1,7 +1,7 @@
 use crate::{Address, OutPoint, Script, TxOutSecrets};
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`lwk_wollet::WalletTxOut`]
+/// Details of a wallet transaction output used in `WalletTx`
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct WalletTxOut {
@@ -37,33 +37,40 @@ impl From<lwk_wollet::Chain> for Chain {
 
 #[wasm_bindgen]
 impl WalletTxOut {
+    /// Return the outpoint (txid and vout) of this `WalletTxOut`.
     pub fn outpoint(&self) -> OutPoint {
         self.inner.outpoint.into()
     }
 
+    /// Return the script pubkey of the address of this `WalletTxOut`.
     #[wasm_bindgen(js_name = scriptPubkey)]
     pub fn script_pubkey(&self) -> Script {
         self.inner.script_pubkey.clone().into()
     }
 
+    /// Return the height of the block containing this output if it's confirmed.
     pub fn height(&self) -> Option<u32> {
         self.inner.height
     }
 
+    /// Return the unblinded values of this `WalletTxOut`.
     pub fn unblinded(&self) -> TxOutSecrets {
         self.inner.unblinded.into()
     }
 
+    /// Return the wildcard index used to derive the address of this `WalletTxOut`.
     #[wasm_bindgen(js_name = wildcardIndex)]
     pub fn wildcard_index(&self) -> u32 {
         self.inner.wildcard_index
     }
 
+    /// Return the chain of this `WalletTxOut`. Can be "Chain::External" or "Chain::Internal" (change).
     #[wasm_bindgen(js_name = extInt)]
     pub fn ext_int(&self) -> Chain {
         self.inner.ext_int.into()
     }
 
+    /// Return the address of this `WalletTxOut`.
     pub fn address(&self) -> Address {
         self.inner.address.clone().into()
     }
@@ -86,6 +93,7 @@ impl From<Option<lwk_wollet::WalletTxOut>> for OptionWalletTxOut {
 
 #[wasm_bindgen]
 impl OptionWalletTxOut {
+    /// Return a copy of the WalletTxOut if it exists, otherwise None
     pub fn get(&self) -> Option<WalletTxOut> {
         self.inner.clone()
     }
@@ -95,7 +103,6 @@ impl OptionWalletTxOut {
 mod tests {
     use super::WalletTxOut;
     use lwk_wollet::elements::{self, hex::ToHex};
-    use std::str::FromStr;
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]

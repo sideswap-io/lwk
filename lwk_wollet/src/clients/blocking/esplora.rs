@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::runtime::Runtime;
 
 use crate::{
-    clients::{asyncr, Capability, Data, History},
+    clients::{asyncr, Capability, Data, EsploraClientBuilder, History},
     store::Height,
     wollet::WolletState,
     ElementsNetwork, Error, WolletDescriptor,
@@ -12,15 +12,27 @@ use crate::{
 
 use super::BlockchainBackend;
 
+impl EsploraClientBuilder {
+    /// Build a blocking Esplora client
+    pub fn build_blocking(self) -> Result<EsploraClient, Error> {
+        Ok(EsploraClient {
+            rt: Runtime::new()?,
+            client: EsploraClientBuilder::build(self)?,
+        })
+    }
+}
+
 #[derive(Debug)]
 /// A blockchain backend implementation based on the
 /// [esplora HTTP API](https://github.com/blockstream/esplora/blob/master/API.md)
+/// But can also use the [waterfalls](https://github.com/RCasatta/waterfalls) endpoint to speed up the scan if supported by the server.
 pub struct EsploraClient {
     rt: Runtime,
     client: asyncr::EsploraClient,
 }
 
 impl EsploraClient {
+    /// Create a new Esplora client
     pub fn new(url: &str, network: ElementsNetwork) -> Result<Self, Error> {
         Ok(Self {
             rt: Runtime::new()?,
@@ -35,9 +47,9 @@ impl EsploraClient {
     pub fn new_waterfalls(url: &str, network: ElementsNetwork) -> Result<Self, Error> {
         Ok(Self {
             rt: Runtime::new()?,
-            client: asyncr::EsploraClientBuilder::new(url, network)
+            client: EsploraClientBuilder::new(url, network)
                 .waterfalls(true)
-                .build(),
+                .build()?,
         })
     }
 
@@ -46,10 +58,12 @@ impl EsploraClient {
         self.client.waterfalls_avoid_encryption = true;
     }
 
+    /// Returns the waterfall server recipient key using a cached value or by asking the server its key
     pub fn waterfalls_server_recipient(&mut self) -> Result<Recipient, Error> {
         self.rt.block_on(self.client.waterfalls_server_recipient())
     }
 
+    /// Set the waterfalls server recipient key. This is used to encrypt the descriptor when calling the waterfalls endpoint.
     pub fn set_waterfalls_server_recipient(&mut self, recipient: Recipient) {
         self.client.set_waterfalls_server_recipient(recipient);
     }
@@ -98,6 +112,10 @@ impl BlockchainBackend for EsploraClient {
             self.client
                 .get_history_waterfalls(descriptor, state, to_index),
         )
+    }
+
+    fn utxo_only(&self) -> bool {
+        self.client.utxo_only
     }
 }
 

@@ -1,32 +1,38 @@
 use lwk_wollet::{bitcoin::bip32::KeySource, elements};
-use serde::Serialize;
-use serde_wasm_bindgen::Serializer;
 use wasm_bindgen::prelude::*;
 
-use crate::{Address, AssetId, Error, Txid};
+use crate::{Address, AssetId, Balance, Txid};
 
-/// PSET details from a perspective of a wallet, wrapper of [`lwk_common::PsetDetails`]
+/// The details of a Partially Signed Elements Transaction:
+///
+/// - the net balance from the point of view of the wallet
+/// - the available and missing signatures for each input
+/// - for issuances and reissuances transactions contains the issuance or reissuance details
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct PsetDetails {
     inner: lwk_common::PsetDetails,
 }
 
-/// PSET details from a perspective of a wallet, wrapper of [`lwk_common::PsetBalance`]
+/// The details regarding balance and amounts in a PSET:
+///
+/// - The fee of the transaction in the PSET
+/// - The net balance of the assets in the PSET from the point of view of the wallet
+/// - The outputs going out of the wallet
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct PsetBalance {
     inner: lwk_common::PsetBalance,
 }
 
-/// PSET details from a perspective of a wallet, wrapper of [`lwk_common::PsetSignatures`]
+/// The details of the signatures in a PSET, divided in available and missing signatures.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct PsetSignatures {
     inner: lwk_common::PsetSignatures,
 }
 
-/// PSET details from a perspective of a wallet, wrapper of [`lwk_common::Issuance`]
+/// The details of an issuance or reissuance.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct Issuance {
@@ -42,6 +48,8 @@ pub struct Recipient {
 
 #[wasm_bindgen]
 impl PsetDetails {
+    /// Return the balance of the PSET from the point of view of the wallet
+    /// that generated this via `psetDetails()`
     pub fn balance(&self) -> PsetBalance {
         self.inner.balance.clone().into()
     }
@@ -56,6 +64,7 @@ impl PsetDetails {
             .collect()
     }
 
+    /// Set of fingerprints for which the PSET is missing a signature
     #[wasm_bindgen(js_name = fingerprintsMissing)]
     pub fn fingerprints_missing(&self) -> Vec<String> {
         self.inner
@@ -65,6 +74,7 @@ impl PsetDetails {
             .collect()
     }
 
+    /// List of fingerprints for which the PSET has a signature
     #[wasm_bindgen(js_name = fingerprintsHas)]
     pub fn fingerprints_has(&self) -> Vec<String> {
         self.inner
@@ -96,9 +106,8 @@ impl PsetBalance {
     }
 
     /// The net balance for every asset with respect of the wallet asking the pset details
-    pub fn balances(&self) -> Result<JsValue, Error> {
-        let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
-        Ok(self.inner.balances.serialize(&serializer)?)
+    pub fn balances(&self) -> Balance {
+        self.inner.balances.clone().into()
     }
 
     pub fn recipients(&self) -> Vec<Recipient> {
@@ -136,29 +145,35 @@ fn convert(data: &[(elements::bitcoin::PublicKey, KeySource)]) -> JsValue {
 
 #[wasm_bindgen]
 impl Issuance {
+    /// Return the asset id or None if it's a null issuance
     pub fn asset(&self) -> Option<AssetId> {
         self.inner.asset().map(Into::into)
     }
 
+    /// Return the token id or None if it's a null issuance
     pub fn token(&self) -> Option<AssetId> {
         self.inner.token().map(Into::into)
     }
 
+    /// Return the previous output index or None if it's a null issuance
     #[wasm_bindgen(js_name = prevVout)]
     pub fn prev_vout(&self) -> Option<u32> {
-        self.inner.prev_vout().map(Into::into)
+        self.inner.prev_vout()
     }
 
+    /// Return the previous transaction id or None if it's a null issuance
     #[wasm_bindgen(js_name = prevTxid)]
     pub fn prev_txid(&self) -> Option<Txid> {
         self.inner.prev_txid().map(Into::into)
     }
 
+    /// Return true if this is effectively an issuance
     #[wasm_bindgen(js_name = isIssuance)]
     pub fn is_issuance(&self) -> bool {
         self.inner.is_issuance()
     }
 
+    /// Return true if this is effectively a reissuance
     #[wasm_bindgen(js_name = isReissuance)]
     pub fn is_reissuance(&self) -> bool {
         self.inner.is_reissuance()
@@ -172,7 +187,7 @@ impl Recipient {
     }
 
     pub fn value(&self) -> Option<u64> {
-        self.inner.value.map(Into::into)
+        self.inner.value
     }
 
     pub fn address(&self) -> Option<Address> {
@@ -270,7 +285,8 @@ mod tests {
         let details = wollet.pset_details(&pset).unwrap();
         assert_eq!(details.balance().fee(), 254);
         let balance: HashMap<lwk_wollet::elements::AssetId, i64> =
-            serde_wasm_bindgen::from_value(details.balance().balances().unwrap()).unwrap();
+            serde_wasm_bindgen::from_value(details.balance().balances().entries().unwrap())
+                .unwrap();
         assert_eq!(
             format!("{:?}", balance),
             "{5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225: -1254}"

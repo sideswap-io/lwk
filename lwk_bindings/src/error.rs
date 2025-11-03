@@ -4,12 +4,23 @@ use elements::pset::ParseError;
 
 /// Possible errors emitted
 #[derive(uniffi::Error, thiserror::Error, Debug)]
+#[allow(missing_docs)]
 pub enum LwkError {
     #[error("{msg}")]
     Generic { msg: String },
 
     #[error("Poison error: {msg}")]
     PoisonError { msg: String },
+
+    #[error("Invoice contain a magic routing hint, there is no need to pay via Boltz, pay directly to: {uri}")]
+    MagicRoutingHint {
+        address: String,
+        amount: u64,
+        uri: String,
+    },
+
+    #[error("Swap {swap_id} has expired with status {status}")]
+    SwapExpired { swap_id: String, status: String },
 }
 
 impl From<lwk_wollet::Error> for LwkError {
@@ -160,6 +171,14 @@ impl From<elements::bitcoin::secp256k1::Error> for LwkError {
     }
 }
 
+impl From<elements::bitcoin::bip32::Error> for LwkError {
+    fn from(value: elements::bitcoin::bip32::Error) -> Self {
+        LwkError::Generic {
+            msg: format!("{:?}", value),
+        }
+    }
+}
+
 impl From<elements::UnblindError> for LwkError {
     fn from(value: elements::UnblindError) -> Self {
         LwkError::Generic {
@@ -172,6 +191,29 @@ impl From<lwk_wollet::elements_miniscript::psbt::Error> for LwkError {
     fn from(value: lwk_wollet::elements_miniscript::psbt::Error) -> Self {
         LwkError::Generic {
             msg: format!("{:?}", value),
+        }
+    }
+}
+
+#[cfg(feature = "lightning")]
+impl From<lwk_boltz::Error> for LwkError {
+    fn from(value: lwk_boltz::Error) -> Self {
+        match value {
+            lwk_boltz::Error::MagicRoutingHint {
+                address,
+                amount,
+                uri,
+            } => LwkError::MagicRoutingHint {
+                address,
+                amount,
+                uri,
+            },
+            lwk_boltz::Error::Expired { swap_id, status } => {
+                LwkError::SwapExpired { swap_id, status }
+            }
+            _ => LwkError::Generic {
+                msg: format!("{:?}", value),
+            },
         }
     }
 }

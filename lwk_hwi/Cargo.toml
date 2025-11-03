@@ -1,9 +1,12 @@
 [package]
 name = "lwk_hwi"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Liquid Wallet Kit - Hardware Wallet Interface"
 license = "MIT OR BSD-2-Clause"
 documentation = "https://docs.rs/lwk_hwi"
+
+[lib]
+test = false
 
 [dependencies]

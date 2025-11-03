@@ -1,6 +1,9 @@
+//! Liquid transaction input
+
 use crate::OutPoint;
 use std::sync::Arc;
 
+/// A transaction input.
 #[derive(uniffi::Object, Debug)]
 pub struct TxIn {
     inner: elements::TxIn,

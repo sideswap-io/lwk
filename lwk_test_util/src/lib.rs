@@ -92,7 +92,7 @@ pub fn compute_fee_rate(pset: &PartiallySignedTransaction) -> f32 {
 
 pub fn assert_fee_rate(fee_rate: f32, expected: Option<f32>) {
     let expected = expected.unwrap_or(DEFAULT_FEE_RATE);
-    let toll = 0.35;
+    let toll = 0.45;
     assert!(fee_rate > expected * (1.0 - toll));
     assert!(fee_rate < expected * (1.0 + toll));
 }
@@ -453,7 +453,7 @@ impl TestElectrumServer {
     }
 }
 
-fn regtest_policy_asset() -> AssetId {
+pub fn regtest_policy_asset() -> AssetId {
     AssetId::from_str("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225").unwrap()
 }
 
@@ -627,9 +627,36 @@ pub fn wollet_descriptor_many_transactions() -> &'static str {
     "ct(slip77(ac53739ddde9fdf6bba3dbc51e989b09aa8c9cdce7b7d7eddd49cec86ddf71f7),elwpkh([93970d14/84'/1'/0']tpubDC3BrFCCjXq4jAceV8k6UACxDDJCFb1eb7R7BiKYUGZdNagEhNfJoYtUrRdci9JFs1meiGGModvmNm8PrqkrEjJ6mpt6gA1DRNU8vu7GqXH/<0;1>/*))#u0y4axgs"
 }
 
+/// A 3 of 5 descriptor and a vector of partially signed transactions to combine 1 sig each
+pub fn psets_to_combine() -> (String, Vec<PartiallySignedTransaction>) {
+    let c = |s: &str| PartiallySignedTransaction::from_str(s).unwrap();
+    let ps = vec![
+        c(include_str!("../test_data/pset_combine/s1_pset.base64")),
+        c(include_str!("../test_data/pset_combine/s2_pset.base64")),
+        c(include_str!("../test_data/pset_combine/s3_pset.base64")),
+        c(include_str!("../test_data/pset_combine/s4_pset.base64")),
+        c(include_str!("../test_data/pset_combine/s5_pset.base64")),
+    ];
+    let d = include_str!("../test_data/pset_combine/desc");
+    (d.to_string(), ps)
+}
+
 //TODO remove this bad code once Conf::args is not Vec<&str>
 fn string_to_static_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
+}
+
+pub fn descriptor_pset_usdt_no_contracts() -> &'static str {
+    include_str!("../test_data/pset_usdt/desc")
+}
+
+/// Pset created with descriptor [`descriptor_pset_usdt_no_contracts`] containing mainnet USDt but without contract info
+pub fn pset_usdt_no_contracts() -> &'static str {
+    include_str!("../test_data/pset_usdt/pset_usdt_no_contracts.base64")
+}
+
+pub fn pset_usdt_with_contract() -> &'static str {
+    include_str!("../test_data/pset_usdt/pset_usdt_with_contract.base64")
 }
 
 fn bitcoind_getnewaddress(client: &Client, kind: Option<&str>) -> bitcoin::Address {

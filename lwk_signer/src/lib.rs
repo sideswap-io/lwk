@@ -1,22 +1,24 @@
-#![cfg_attr(not(test), deny(clippy::unwrap_used))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-
 //! Contains a software signer [`SwSigner`] and an [`AnySigner`] that can be a Jade or a Software signer.
 //!
 //! Signers should implement [`lwk_common::Signer`]
 
-mod software;
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![warn(missing_docs)]
 
+mod software;
 pub use crate::software::{sign_with_seckey, NewError, SignError, SwSigner};
 pub use bip39;
 
 use elements_miniscript::bitcoin::bip32::{self, DerivationPath, Fingerprint};
+use elements_miniscript::bitcoin::sign_message::MessageSignature;
 use elements_miniscript::elements::bitcoin::bip32::Xpub;
 use elements_miniscript::elements::pset::PartiallySignedTransaction;
 use lwk_common::Signer;
 
 /// Possible errors when signing with [`AnySigner`]
 #[derive(thiserror::Error, Debug)]
+#[allow(missing_docs)]
 pub enum SignerError {
     #[error(transparent)]
     Software(#[from] SignError),
@@ -36,11 +38,14 @@ pub enum SignerError {
 /// A signer that can be a software signer [`SwSigner`] or a [`lwk_jade::Jade`]
 #[derive(Debug)]
 pub enum AnySigner {
+    /// A software signer [`SwSigner`]
     Software(SwSigner),
 
+    /// A Jade signer [`lwk_jade::Jade`]
     #[cfg(feature = "jade")]
     Jade(lwk_jade::Jade, elements_miniscript::bitcoin::XKeyIdentifier),
 
+    /// A Ledger signer [`lwk_ledger::Ledger`]
     #[cfg(feature = "ledger")]
     Ledger(
         lwk_ledger::Ledger<lwk_ledger::TransportTcp>,
@@ -67,6 +72,14 @@ impl Signer for AnySigner {
 
     fn fingerprint(&self) -> Result<Fingerprint, Self::Error> {
         Signer::fingerprint(&self)
+    }
+
+    fn sign_message(
+        &self,
+        message: &str,
+        path: &DerivationPath,
+    ) -> Result<MessageSignature, Self::Error> {
+        Signer::sign_message(&self, message, path)
     }
 }
 
@@ -120,6 +133,22 @@ impl Signer for &AnySigner {
 
             #[cfg(feature = "ledger")]
             AnySigner::Ledger(s, _) => s.fingerprint()?,
+        })
+    }
+
+    fn sign_message(
+        &self,
+        message: &str,
+        path: &DerivationPath,
+    ) -> Result<MessageSignature, Self::Error> {
+        Ok(match self {
+            AnySigner::Software(s) => s.sign_message(message, path)?,
+
+            #[cfg(feature = "jade")]
+            AnySigner::Jade(s, _) => s.sign_message(message, path)?,
+
+            #[cfg(feature = "ledger")]
+            AnySigner::Ledger(s, _) => s.sign_message(message, path)?,
         })
     }
 }

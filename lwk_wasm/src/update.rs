@@ -2,7 +2,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::{Error, Wollet, WolletDescriptor};
 
-/// Wrapper of [`lwk_wollet::Update`]
+/// An Update contains the delta of information to be applied to the wallet to reach the latest status.
+/// It's created passing a reference to the wallet to the blockchain client
 #[wasm_bindgen]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
@@ -41,15 +42,22 @@ impl Update {
         Ok(lwk_wollet::Update::deserialize(bytes)?.into())
     }
 
+    /// Serialize an update to a byte array
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         Ok(self.inner.serialize()?)
     }
 
+    /// Serialize an update to a base64 encoded string,
+    /// encrypted with a key derived from the descriptor.
+    /// Decrypt using `deserialize_decrypted_base64()`
     #[wasm_bindgen(js_name = serializeEncryptedBase64)]
     pub fn serialize_encrypted_base64(&self, desc: &WolletDescriptor) -> Result<String, Error> {
         Ok(self.inner.serialize_encrypted_base64(desc.as_ref())?)
     }
 
+    /// Deserialize an update from a base64 encoded string,
+    /// decrypted with a key derived from the descriptor.
+    /// Create the base64 using `serialize_encrypted_base64()`
     #[wasm_bindgen(js_name = deserializeDecryptedBase64)]
     pub fn deserialize_decrypted_base64(
         base64: &str,
@@ -58,11 +66,13 @@ impl Update {
         Ok(lwk_wollet::Update::deserialize_decrypted_base64(base64, desc.as_ref())?.into())
     }
 
+    /// Whether this update only changes the tip
     #[wasm_bindgen(js_name = onlyTip)]
     pub fn only_tip(&self) -> bool {
         self.inner.only_tip()
     }
 
+    /// Prune the update, removing unneeded data from transactions.
     pub fn prune(&mut self, wollet: &Wollet) {
         self.inner.prune(wollet.as_ref());
     }

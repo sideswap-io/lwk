@@ -1,9 +1,10 @@
-use crate::{Error, Script};
+use crate::{Error, Network, Script};
 use lwk_wollet::elements::{self, AddressParams};
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`elements::Address`]
+/// An Elements (Liquid) address
 #[wasm_bindgen]
+#[derive(Debug)]
 pub struct Address {
     inner: elements::Address,
 }
@@ -43,32 +44,47 @@ impl std::fmt::Display for Address {
 #[wasm_bindgen]
 impl Address {
     /// Creates an `Address`
+    ///
+    /// If you know the network, you can use `parse()` to validate that the network is consistent.
     #[wasm_bindgen(constructor)]
     pub fn new(s: &str) -> Result<Address, Error> {
         let inner: elements::Address = s.parse()?;
         Ok(inner.into())
     }
 
+    /// Parses an `Address` ensuring is for the right network
+    pub fn parse(s: &str, network: &Network) -> Result<Address, Error> {
+        let common_addr = lwk_common::Address::parse(s, (*network).into())?;
+        let inner: elements::Address = common_addr.into();
+        Ok(inner.into())
+    }
+
+    /// Return the script pubkey of the address.
     #[wasm_bindgen(js_name = scriptPubkey)]
     pub fn script_pubkey(&self) -> Script {
         self.inner.script_pubkey().into()
     }
 
+    /// Return true if the address is blinded, in other words, if it has a blinding key.
     #[wasm_bindgen(js_name = isBlinded)]
     pub fn is_blinded(&self) -> bool {
         self.inner.is_blinded()
     }
 
+    /// Return true if the address is for mainnet.
     #[wasm_bindgen(js_name = isMainnet)]
     pub fn is_mainnet(&self) -> bool {
         self.inner.params == &AddressParams::LIQUID
     }
 
+    /// Return the unconfidential address, in other words, the address without the blinding key.
     #[wasm_bindgen(js_name = toUnconfidential)]
     pub fn to_unconfidential(&self) -> Address {
         self.inner.to_unconfidential().into()
     }
 
+    /// Return the string representation of the address.
+    /// This representation can be used to recreate the address via `new()`
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)
@@ -96,7 +112,9 @@ impl Address {
     }
 }
 
-/// Wrapper of [`lwk_wollet::AddressResult`]
+/// Value returned from asking an address to the wallet.
+/// Containing the confidential address and its
+/// derivation index (the last element in the derivation path)
 #[wasm_bindgen]
 pub struct AddressResult {
     inner: lwk_wollet::AddressResult,
@@ -110,10 +128,12 @@ impl From<lwk_wollet::AddressResult> for AddressResult {
 
 #[wasm_bindgen]
 impl AddressResult {
+    /// Return the address.
     pub fn address(&self) -> Address {
         self.inner.address().into()
     }
 
+    /// Return the derivation index of the address.
     pub fn index(&self) -> u32 {
         self.inner.index()
     }
@@ -146,6 +166,20 @@ mod tests {
             "0014d0c4a3ef09e997b6e99e397e518fe3e41a118ca1"
         );
 
-        assert_eq!(address.qr_code_uri(None).unwrap(), "data:image/bmp;base64,Qk2GAQAAAAAAAD4AAAAoAAAAKQAAACkAAAABAAEAAAAAAEgBAAAAAgAAAAIAAAIAAAACAAAA////AAAAAAD+rhsdLwAAAIIBYidDgAAAuitpGseAAAC6FxQO0AAAALqGM/j4gAAAghPrII2AAAD+hUGKrAAAAACdlV+PgAAAw5WVyv2AAAAUfcT/9gAAAD62KlcnAAAAqV5aRQcAAADLW8XukAAAAAmtIQ39AAAA0sDx+G0AAAA4q8MaVAAAAOJCysWLgAAAQFCHbgKAAAB2Pxvq2oAAAMT876hGgAAA2ueBU1MAAAC4AQzPZYAAAI6ot+xlgAAA0fxBqruAAADX4QbxQAAAAKgn3wI9AAAA9mvTjNQAAADhUNCr54AAANcOWlNNAAAAxKq3TqUAAACnH0+yiIAAAFi4oJQIAAAAi8J7NXyAAAAAvg4kAAAAAP6qqqq/gAAAgtYuIaCAAAC6/AzSLoAAALrgXA4ugAAAuiJqsa6AAACCIz/toIAAAP7clm2/gAAA");
+        assert_eq!(address.qr_code_uri(None).unwrap(), "data:image/bmp;base64,Qk2GAQAAAAAAAD4AAAAoAAAAKQAAACkAAAABAAEAAAAAAEgBAAAAAgAAAAIAAAIAAAACAAAA////AAAAAAD+rtsVLwAAAIJnIiVDgAAAuk9JGoeAAAC6U1QO0AAAALqGM/j4gAAAghPrII2AAAD+hUGKrAAAAACdlV+PgAAA25WVyv2AAAAcfcT/9gAAAD62KlcnAAAAqV5aRQcAAADLSsXvkAAAAAmloRT9AAAA0tHx8G0AAAA4qEMaVAAAAOIoSs2LgAAAQHSHbAKAAAB2Hxvu2oAAAMS476hGgAAA2ueBU1MAAACYAQzPZYAAAL6ot+xlgAAAoPxBqruAAACHYQbxQAAAAOgn3wI9AAAAdmvTjNQAAABhUNCr54AAANceWkNNAAAAxKM3VqUAAACnB0+6iIAAAFiioJQIAAAAi6B7NXyAAAAA3g4mAAAAAP6qqqq/gAAAgrAuJ6CAAAC6vAzSLoAAALrgXA4ugAAAuiJqsa6AAACCIz/toIAAAP7clm2/gAAA");
+
+        let address_network_check = Address::parse(
+            address_str,
+            &lwk_wollet::ElementsNetwork::LiquidTestnet.into(),
+        )
+        .unwrap();
+        assert_eq!(address_network_check.to_string(), address_str);
+
+        let address_network_check_fail =
+            Address::parse(address_str, &lwk_wollet::ElementsNetwork::Liquid.into()).unwrap_err();
+        assert_eq!(
+            address_network_check_fail.to_string(),
+            "Expected a mainnet address but got a testnet one"
+        );
     }
 }

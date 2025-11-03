@@ -1,5 +1,5 @@
 use crate::bitcoin::bip32::Fingerprint;
-use crate::clients::LastUnused;
+use crate::clients::{try_unblind, LastUnused};
 use crate::config::{Config, ElementsNetwork};
 use crate::descriptor::Chain;
 use crate::elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
@@ -24,9 +24,11 @@ use elements_miniscript::{
     ConfidentialDescriptor, DefiniteDescriptorKey, Descriptor, DescriptorPublicKey,
 };
 use fxhash::FxHasher;
-use lwk_common::{burn_script, pset_balance, pset_issuances, pset_signatures, PsetDetails};
+use lwk_common::{
+    burn_script, pset_balance, pset_issuances, pset_signatures, Balance, PsetDetails,
+};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::{atomic, Arc};
@@ -36,7 +38,7 @@ pub struct Wollet {
     pub(crate) config: Config,
     pub store: Store,
     pub(crate) persister: Arc<dyn Persister + Send + Sync>,
-    descriptor: WolletDescriptor,
+    pub(crate) descriptor: WolletDescriptor,
     // cached value
     max_weight_to_satisfy: usize,
 }
@@ -55,6 +57,7 @@ pub struct WolletConciseState {
     last_unused: LastUnused,
 }
 
+#[allow(unused)]
 pub trait WolletState {
     fn get_script_batch(
         &self,
@@ -193,16 +196,8 @@ impl WolletState for Wollet {
     fn last_unused(&self) -> LastUnused {
         // TODO use LastUnused internally in Wollet
         LastUnused {
-            internal: self
-                .store
-                .cache
-                .last_unused_internal
-                .load(atomic::Ordering::Relaxed),
-            external: self
-                .store
-                .cache
-                .last_unused_external
-                .load(atomic::Ordering::Relaxed),
+            internal: self.last_unused_internal(),
+            external: self.last_unused_external(),
         }
     }
 
@@ -254,6 +249,7 @@ impl Wollet {
         Ok(wollet)
     }
 
+    /// Whether the wallet is segwit (BIP141)
     pub fn is_segwit(&self) -> bool {
         self.descriptor()
             .descriptor
@@ -262,11 +258,17 @@ impl Wollet {
             .is_some()
     }
 
+    /// Whether the wallet is AMP0
+    pub fn is_amp0(&self) -> bool {
+        self.descriptor.is_amp0()
+    }
+
     /// Max weight to satisfy for inputs belonging to this wallet
     pub fn max_weight_to_satisfy(&self) -> usize {
         self.max_weight_to_satisfy
     }
 
+    /// Get a concise state of the wallet, allowing to perform a scan (like [`crate::clients::blocking::BlockchainBackend::full_scan()`]) without holding the lock on the wallet.
     pub fn state(&self) -> WolletConciseState {
         let cache = &self.store.cache;
         WolletConciseState {
@@ -346,6 +348,11 @@ impl Wollet {
     /// If Some return the address at the given index,
     /// otherwise the last unused address.
     pub fn address(&self, index: Option<u32>) -> Result<AddressResult, Error> {
+        if index.is_some() && !self.descriptor.has_wildcard() {
+            // TODO: this error should be upstreamed to at_derivation_index https://github.com/rust-bitcoin/rust-miniscript/issues/829
+            return Err(Error::IndexWithoutWildcard);
+        }
+
         let index = self.unwrap_or_last_unused(index);
 
         let address = self
@@ -377,16 +384,22 @@ impl Wollet {
         Ok(BitcoinAddressResult::new(address, index))
     }
 
+    pub(crate) fn last_unused_external(&self) -> u32 {
+        let cache = &self.store.cache;
+        cache.last_unused_external.load(atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn last_unused_internal(&self) -> u32 {
+        let cache = &self.store.cache;
+        cache.last_unused_internal.load(atomic::Ordering::Relaxed)
+    }
+
     /// Returns the given `index` unwrapped if Some, otherwise
     /// takes the last unused external index of the wallet
     fn unwrap_or_last_unused(&self, index: Option<u32>) -> u32 {
         match index {
             Some(i) => i,
-            None => self
-                .store
-                .cache
-                .last_unused_external
-                .load(atomic::Ordering::Relaxed),
+            None => self.last_unused_external(),
         }
     }
 
@@ -400,11 +413,7 @@ impl Wollet {
     pub fn change(&self, index: Option<u32>) -> Result<AddressResult, Error> {
         let index = match index {
             Some(i) => i,
-            None => self
-                .store
-                .cache
-                .last_unused_internal
-                .load(atomic::Ordering::Relaxed),
+            None => self.last_unused_internal(),
         };
 
         let address = self
@@ -541,6 +550,60 @@ impl Wollet {
         Ok(utxos)
     }
 
+    /// Extract the wallet UTXOs that a PSET is creating
+    ///
+    /// This function returns [`crate::model::ExternalUtxo`]s so it possible to spend them (using
+    /// [`crate::TxBuilder::add_external_utxos()`]) without broadcasting the transaction.
+    pub fn extract_wallet_utxos(
+        &self,
+        pset: &PartiallySignedTransaction,
+    ) -> Result<Vec<ExternalUtxo>, Error> {
+        let mut utxos = vec![];
+        let tx = pset.extract_tx()?;
+        let txid = tx.txid();
+        for (vout, output) in pset.outputs().iter().enumerate() {
+            if self.store.cache.paths.contains_key(&output.script_pubkey) {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                // FIXME: also extract explicit utxos
+                let txout = output.to_txout();
+                if let Ok(unblinded) = try_unblind(&txout, &self.descriptor) {
+                    let tx_ = if self.is_segwit() {
+                        None
+                    } else {
+                        Some(tx.clone())
+                    };
+                    utxos.push(ExternalUtxo {
+                        outpoint,
+                        txout,
+                        tx: tx_,
+                        unblinded,
+                        max_weight_to_satisfy: self.max_weight_to_satisfy,
+                    });
+                }
+            }
+        }
+        Ok(utxos)
+    }
+
+    /// Get the transaction outputs that the wallet was unable to unbind
+    ///
+    /// In some particular situation they can be unblinded with [`crate::Wollet::reunblind()`].
+    pub fn txos_cannot_unblind(&self) -> Result<Vec<OutPoint>, Error> {
+        let mut txos = vec![];
+        for (txid, tx) in self.store.cache.all_txs.iter() {
+            for (vout, o) in tx.output.iter().enumerate() {
+                let outpoint = OutPoint::new(*txid, vout as u32);
+                if !o.script_pubkey.is_empty()
+                    && self.store.cache.paths.contains_key(&o.script_pubkey)
+                    && !self.store.cache.unblinded.contains_key(&outpoint)
+                {
+                    txos.push(outpoint);
+                }
+            }
+        }
+        Ok(txos)
+    }
+
     /// Return UTXOs unblinded with a custom blinding key
     ///
     /// They can be spent using [`crate::TxBuilder::add_external_utxos()`]
@@ -581,22 +644,47 @@ impl Wollet {
         Ok(utxos)
     }
 
-    pub(crate) fn balance_from_utxos(
-        &self,
-        utxos: &[WalletTxOut],
-    ) -> Result<BTreeMap<AssetId, u64>, Error> {
+    /// Attempt to unblind transaction outputs again
+    ///
+    /// In some quite particular situations, the wollet might have not unblinded some of
+    /// its transaction outputs. This function allows to attempt to unblind them again.
+    pub fn reunblind(&mut self) -> Result<Vec<OutPoint>, Error> {
+        let mut txos = vec![];
+        for (txid, tx) in self.store.cache.all_txs.iter() {
+            for (vout, txout) in tx.output.iter().enumerate() {
+                if self.store.cache.paths.contains_key(&txout.script_pubkey) {
+                    let outpoint = OutPoint::new(*txid, vout as u32);
+                    if let Entry::Vacant(e) = self.store.cache.unblinded.entry(outpoint) {
+                        if let Ok(unblinded) = try_unblind(txout, &self.descriptor) {
+                            e.insert(unblinded);
+                            txos.push(outpoint);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(txos)
+    }
+
+    pub(crate) fn balance_from_utxos(&self, utxos: &[WalletTxOut]) -> Result<Balance, Error> {
         let mut r = BTreeMap::new();
         r.entry(self.policy_asset()).or_insert(0);
         for u in utxos.iter() {
             *r.entry(u.unblinded.asset).or_default() += u.unblinded.value;
         }
-        Ok(r)
+        Ok(r.into())
     }
 
     /// Get the wallet balance
-    pub fn balance(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
+    pub fn balance(&self) -> Result<Balance, Error> {
         let utxos = self.utxos()?;
         self.balance_from_utxos(&utxos)
+    }
+
+    /// Get the asset identifiers owned by the wallet
+    pub fn assets_owned(&self) -> Result<HashSet<AssetId>, Error> {
+        let utxos = self.utxos()?;
+        Ok(utxos.iter().map(|utxo| utxo.unblinded.asset).collect())
     }
 
     /// Get the wallet transactions with pagination
@@ -640,7 +728,7 @@ impl Wollet {
                 tx: tx.clone(),
                 txid: **txid,
                 height: **height,
-                balance,
+                balance: balance.into(),
                 fee,
                 type_,
                 timestamp,
@@ -676,7 +764,7 @@ impl Wollet {
                 tx: tx.clone(),
                 txid: *txid,
                 height: *height,
-                balance,
+                balance: balance.into(),
                 fee,
                 type_,
                 timestamp,
@@ -814,14 +902,60 @@ impl Wollet {
         Ok(res)
     }
 
+    /// Finalize a PSET, extracting a broadcastable transaction
     pub fn finalize(&self, pset: &mut PartiallySignedTransaction) -> Result<Transaction, Error> {
+        // elements-miniscript does not finalize PSET inputs if they have signature with different
+        // sighashes. To workaround this, if necessary we replace the sighash in the signatures
+        // with the sighash set in the PSET input. Then we finalize the PSET and later we replace
+        // the sighashes with the original ones.
+        let mut original_sigs = vec![];
+        for i in pset.inputs_mut() {
+            let sighash = i.sighash_type.map(|s| s.to_u32()).unwrap_or(1) as u8;
+            if i.partial_sigs.len() > 1 {
+                for sig in i.partial_sigs.values_mut() {
+                    let sig_len = sig.len();
+                    if sig_len > 0 && sig[sig_len - 1] != sighash {
+                        original_sigs.push(sig.clone());
+                        sig[sig_len - 1] = sighash;
+                    }
+                }
+            }
+        }
+
         // genesis_hash is only used for BIP341 (taproot) sighash computation
         let result = pset.finalize_mut(&EC, BlockHash::all_zeros());
+
+        // Replace the original sighashes in the finalized signatures
+        for original_sig in original_sigs {
+            for i in pset.inputs_mut() {
+                // TODO: also for pre-segwit inputs
+                if let Some(witness) = &mut i.final_script_witness {
+                    for e in witness.iter_mut() {
+                        let len = original_sig.len();
+                        if e.len() == len && e[0..(len - 1)] == original_sig[0..(len - 1)] {
+                            *e = original_sig.clone();
+                        }
+                    }
+                }
+            }
+        }
+
         if let Err(errors) = result {
             if !errors.is_empty() && errors.len() == pset.inputs().len() {
-                // Failed to finalize all inputs
-                // TODO: do not use Generic
-                return Err(Error::Generic(format!("{:?}", errors)));
+                // In some case "finalize" finalizes all inputs but return some error
+                let seems_finalized = |i: &elements::pset::Input| -> bool {
+                    i.partial_sigs.is_empty()
+                        && (!i
+                            .final_script_witness
+                            .as_ref()
+                            .is_some_and(|v| v.is_empty())
+                            || !i.final_script_sig.as_ref().is_some_and(|v| v.is_empty()))
+                };
+                if !pset.inputs().iter().all(seems_finalized) {
+                    // Failed to finalize all inputs
+                    // TODO: do not use Generic
+                    return Err(Error::Generic(format!("{:?}", errors)));
+                }
             }
             // If some inputs have been finalized ignore the other errors
         }
@@ -829,6 +963,8 @@ impl Wollet {
         Ok(pset.extract_tx()?)
     }
 
+    /// Get all the persisted updates of this wallet.
+    /// Applying in the same order these updates to an empty wallet, recreates this wallet state.
     pub fn updates(&self) -> Result<Vec<Update>, PersistError> {
         let mut updates = vec![];
         for i in 0.. {
@@ -973,7 +1109,7 @@ fn tx_outputs(
         .collect()
 }
 
-/// Blockchain tip
+/// Blockchain tip, the highest valid block in the blockchain
 pub struct Tip {
     height: Height,
     hash: BlockHash,
@@ -981,12 +1117,17 @@ pub struct Tip {
 }
 
 impl Tip {
+    /// The height of the tip
     pub fn height(&self) -> Height {
         self.height
     }
+
+    /// The hash of the block at the tip
     pub fn hash(&self) -> BlockHash {
         self.hash
     }
+
+    /// The timestamp of the tip as unix timestamp (seconds since epoch)
     pub fn timestamp(&self) -> Option<Timestamp> {
         self.timestamp
     }
@@ -1007,6 +1148,23 @@ pub fn derive_script_and_blinding_key(
             .blinding_pubkey
             .expect("descriptor used include blinding key"),
     ))
+}
+
+#[cfg(feature = "test_wallet")]
+impl Wollet {
+    /// Create a new random test wallet with its signer.
+    pub fn test_wallet() -> Result<(lwk_signer::SwSigner, Self), Error> {
+        use lwk_common::Signer;
+        use std::str::FromStr;
+
+        let signer = lwk_signer::SwSigner::random(false)?.0;
+        let desc = signer.wpkh_slip77_descriptor().map_err(Error::Generic)?;
+        let desc = WolletDescriptor::from_str(&desc)?;
+        Ok((
+            signer,
+            Wollet::new(ElementsNetwork::default_regtest(), NoPersist::new(), desc)?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1179,6 +1337,21 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Update height 1 too old (internal height 3)"
+        );
+    }
+
+    #[test]
+    fn test_desc_no_wildcard_with_index() {
+        let k = "9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023";
+        let x = "tpubDC8msFGeGuwnKG9Upg7DM2b4DaRqg3CUZa5g8v2SRQ6K4NSkxUgd7HsL2XVWbVm39yBA4LAxysQAm397zwQSQoQgewGiYZqrA9DsP4zbQ1M";
+        let desc = format!("ct(slip77({k}),elwpkh({x}))");
+        let w = new_wollet(&desc);
+        let a = w.address(None).unwrap();
+        assert_eq!(a.address().to_string(), "tlq1qqtkq6nptvwfycgsvkclsg8uyslwy9pn5mmw6049nmqq02y7l9330a6vmsc5zdfq2xtpyc7tct5rtr80rlvrk7jll6mc5gjfup");
+        let e = w.address(Some(0)).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Cannot use derivation index when the descriptor has no wildcard"
         );
     }
 

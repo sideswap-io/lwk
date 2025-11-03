@@ -3,7 +3,7 @@ use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
 use std::fmt::Display;
 use wasm_bindgen::prelude::*;
 
-/// Partially Signed Elements Transaction, wrapper of [`PartiallySignedTransaction`]
+/// Partially Signed Elements Transaction
 #[wasm_bindgen]
 #[derive(PartialEq, Debug, Clone)]
 pub struct Pset {
@@ -30,7 +30,7 @@ impl Display for Pset {
 
 #[wasm_bindgen]
 impl Pset {
-    /// Creates a `Pset`
+    /// Creates a `Pset` from its base64 string representation.
     #[wasm_bindgen(constructor)]
     pub fn new(base64: &str) -> Result<Pset, Error> {
         if base64.trim().is_empty() {
@@ -40,26 +40,33 @@ impl Pset {
         Ok(pset.into())
     }
 
+    /// Return a base64 string representation of the Pset.
+    /// The string can be used to re-create the Pset via `new()`
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)
     }
 
+    /// Extract the Transaction from a Pset by filling in
+    /// the available signature information in place.
     #[wasm_bindgen(js_name = extractTx)]
     pub fn extract_tx(&self) -> Result<Transaction, Error> {
         let tx: Transaction = self.inner.extract_tx()?.into();
         Ok(tx)
     }
 
+    /// Attempt to merge with another `Pset`.
     pub fn combine(&mut self, other: Pset) -> Result<(), Error> {
         self.inner.merge(other.into())?;
         Ok(())
     }
 
+    /// Return a copy of the inputs of this PSET
     pub fn inputs(&self) -> Vec<PsetInput> {
         self.inner.inputs().iter().map(Into::into).collect()
     }
 
+    /// Return a copy of the outputs of this PSET
     pub fn outputs(&self) -> Vec<PsetOutput> {
         self.inner.outputs().iter().map(Into::into).collect()
     }
@@ -82,11 +89,13 @@ impl From<&Input> for PsetInput {
 #[wasm_bindgen]
 impl PsetInput {
     /// Prevout TXID of the input
+    #[wasm_bindgen(js_name = previousTxid)]
     pub fn previous_txid(&self) -> Txid {
         self.inner.previous_txid.into()
     }
 
     /// Prevout vout of the input
+    #[wasm_bindgen(js_name = previousVout)]
     pub fn previous_vout(&self) -> u32 {
         self.inner.previous_output_index
     }
@@ -124,6 +133,7 @@ impl From<&Output> for PsetOutput {
 
 #[wasm_bindgen]
 impl PsetOutput {
+    #[wasm_bindgen(js_name = scriptPubkey)]
     pub fn script_pubkey(&self) -> Script {
         self.inner.script_pubkey.clone().into()
     }

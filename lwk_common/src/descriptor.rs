@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::Signer;
 
 // TODO impl error handling
-pub fn singlesig_desc<S: Signer>(
+/// Generate a singlesig descriptor with the given parameters
+pub fn singlesig_desc<S: Signer + ?Sized>(
     signer: &S,
     script_variant: Singlesig,
     blinding_variant: DescriptorBlindingKey,
@@ -53,6 +54,7 @@ fn fmt_path(path: &DerivationPath) -> String {
 }
 
 // TODO impl error handling
+/// Generate a multisig descriptor with the given parameters
 pub fn multisig_desc(
     threshold: u32,
     xpubs: Vec<(Option<KeySource>, Xpub)>,
@@ -101,14 +103,16 @@ pub fn multisig_desc(
 }
 
 #[derive(Debug, Clone, Copy)]
+/// The variant of the singlesig descriptor
 pub enum Singlesig {
-    /// as defined by bip84
+    /// Witness public key hash as defined by bip84
     Wpkh,
 
-    /// as defined by bip49
+    /// Witness public key hash wrapped in script hash as defined by bip49
     ShWpkh,
 }
 
+/// The error type returned by Singlesig::from_str
 #[derive(Error, Debug)]
 #[error("Invalid singlesig variant '{0}' supported variant are: 'wpkh', 'shwpkh'")]
 pub struct InvalidSinglesigVariant(String);
@@ -152,6 +156,7 @@ pub enum DescriptorBlindingKey {
     Elip151,
 }
 
+/// The error type returned by `DescriptorBlindingKey::from_str`
 #[derive(Error, Debug)]
 #[error("Invalid blinding key variant '{0}' supported variant are: 'slip77', 'elip151'")]
 pub struct InvalidBlindingKeyVariant(String);
@@ -169,6 +174,7 @@ impl FromStr for DescriptorBlindingKey {
     }
 }
 
+/// The variant of the descriptor like specified in the bips
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Bip {
     /// For P2WPKH wallets
@@ -189,6 +195,7 @@ impl std::fmt::Display for Bip {
     }
 }
 
+/// The error type returned by Bip::from_str
 #[derive(Error, Debug)]
 #[error("Invalid bip  variant '{0}' supported variant are: 'bip84'")]
 pub struct InvalidBipVariant(String);
@@ -206,10 +213,13 @@ impl FromStr for Bip {
     }
 }
 
+/// The variant of the multisig descriptor
 pub enum Multisig {
+    /// Witness script hash
     Wsh,
 }
 
+/// The variant of the multisig descriptor
 #[derive(Error, Debug)]
 #[error("Invalid multisig variant '{0}' supported variant are: 'wsh'")]
 pub struct InvalidMultisigVariant(String);

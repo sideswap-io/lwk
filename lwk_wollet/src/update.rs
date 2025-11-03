@@ -1,3 +1,4 @@
+use crate::clients::try_unblind;
 use crate::descriptor::Chain;
 use crate::elements::{OutPoint, Script, Transaction, TxOutSecrets, Txid};
 use crate::error::Error;
@@ -5,13 +6,17 @@ use crate::store::{Height, Timestamp};
 use crate::wollet::WolletState;
 use crate::EC;
 use crate::{BlindingPublicKey, Wollet, WolletDescriptor};
+#[allow(deprecated)]
 use aes_gcm_siv::aead::generic_array::GenericArray;
 use aes_gcm_siv::aead::AeadMutInPlace;
 use base64::prelude::*;
 use elements::bitcoin::bip32::ChildNumber;
+use elements::bitcoin::hashes::Hash;
 use elements::confidential::{AssetBlindingFactor, ValueBlindingFactor};
 use elements::encode::{Decodable, Encodable};
-use elements::{BlockHeader, TxInWitness, TxOutWitness};
+use elements::hash_types::TxMerkleNode;
+use elements::{BlockExtData, BlockHash, BlockHeader, TxInWitness, TxOutWitness};
+use lwk_common::SignedBalance;
 use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use std::sync::atomic;
@@ -53,6 +58,7 @@ impl DownloadTxResult {
 /// contains the delta of information to be applied to the wallet to reach the latest status.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
+    /// The version of the update
     pub version: u8,
 
     /// The status of the wallet this update is generated from
@@ -60,36 +66,54 @@ pub struct Update {
     /// If 0 means it has been deserialized from a V0 version
     pub wollet_status: u64,
 
+    /// The new transactions
     pub new_txs: DownloadTxResult,
+
+    /// The new transaction with confirmation heights (or None if not confirmed)
     pub txid_height_new: Vec<(Txid, Option<Height>)>,
+
+    /// The transaction ids to delete, for example after a reorg or a replace by fee.
     pub txid_height_delete: Vec<Txid>,
+
+    /// The timestamps of the transactions, more precisely the timestamp of the block containing the transaction
     pub timestamps: Vec<(Height, Timestamp)>,
 
     /// The script pub key with the chain, the child number and the blinding pubkey
     /// The blinding pubkey is optional for backward compatibility reasons
     pub scripts_with_blinding_pubkey: Vec<(Chain, ChildNumber, Script, Option<BlindingPublicKey>)>,
+
+    /// The tip of the blockchain at the time the update was generated
     pub tip: BlockHeader,
 }
 
 impl Update {
+    /// Whether this update only changes the tip
     pub fn only_tip(&self) -> bool {
         self.new_txs.is_empty()
             && self.txid_height_new.is_empty()
             && self.txid_height_delete.is_empty()
             && self.scripts_with_blinding_pubkey.is_empty()
     }
+
+    /// Prune the update, removing unneeded data from transactions.
     pub fn prune(&mut self, wallet: &Wollet) {
         self.new_txs.prune(&wallet.store.cache.paths);
     }
+
+    /// Serialize an [`Update`] to a byte array
     pub fn serialize(&self) -> Result<Vec<u8>, elements::encode::Error> {
         let mut vec = vec![];
         self.consensus_encode(&mut vec)?;
         Ok(vec)
     }
+
+    /// Deserialize an [`Update`] from a byte array
     pub fn deserialize(bytes: &[u8]) -> Result<Update, elements::encode::Error> {
         Update::consensus_decode(bytes)
     }
 
+    /// Serialize an update to a byte array, encrypted with a key derived from the descriptor. Decrypt using [`Self::deserialize_decrypted()`]
+    #[allow(deprecated)]
     pub fn serialize_encrypted(&self, desc: &WolletDescriptor) -> Result<Vec<u8>, Error> {
         let mut plaintext = self.serialize()?;
 
@@ -107,11 +131,14 @@ impl Update {
         Ok(result)
     }
 
+    /// Serialize an update to a base64 encoded string, encrypted with a key derived from the descriptor. Decrypt using [`Self::deserialize_decrypted_base64()`]
     pub fn serialize_encrypted_base64(&self, desc: &WolletDescriptor) -> Result<String, Error> {
         let vec = self.serialize_encrypted(desc)?;
         Ok(BASE64_STANDARD.encode(vec))
     }
 
+    /// Deserialize an update from a byte array, decrypted with a key derived from the descriptor. Create the byte array using [`Self::serialize_encrypted()`]
+    #[allow(deprecated)]
     pub fn deserialize_decrypted(bytes: &[u8], desc: &WolletDescriptor) -> Result<Update, Error> {
         let nonce_bytes = &bytes
             .get(..12)
@@ -127,6 +154,7 @@ impl Update {
         Ok(Update::deserialize(&plaintext)?)
     }
 
+    /// Deserialize an update from a base64 encoded string, decrypted with a key derived from the descriptor. Create the base64 using [`Self::serialize_encrypted_base64()`]
     pub fn deserialize_decrypted_base64(
         base64: &str,
         desc: &WolletDescriptor,
@@ -138,11 +166,79 @@ impl Update {
     }
 }
 
+fn default_blockheader() -> BlockHeader {
+    BlockHeader {
+        version: 0,
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: 0,
+        height: 0,
+        ext: BlockExtData::default(),
+    }
+}
+
+/// Update the wallet state from blockchain data
 impl Wollet {
+    fn apply_transaction_inner(
+        &mut self,
+        tx: Transaction,
+        do_persist: bool,
+    ) -> Result<SignedBalance, Error> {
+        let initial_balance = self.balance()?;
+        let mut unblinds = vec![];
+        let txid = tx.txid();
+        for (vout, output) in tx.output.iter().enumerate() {
+            if self.store.cache.paths.contains_key(&output.script_pubkey) {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                match try_unblind(output, &self.descriptor) {
+                    Ok(unblinded) => {
+                        unblinds.push((outpoint, unblinded));
+                    }
+                    Err(_) => {
+                        log::info!("{} cannot unblind, ignoring (could be sender messed up with the blinding process)", outpoint);
+                    }
+                }
+            }
+        }
+
+        let update = Update {
+            version: 2,
+            wollet_status: self.status(),
+            new_txs: DownloadTxResult {
+                txs: vec![(txid, tx)],
+                unblinds,
+            },
+            txid_height_new: vec![(txid, None)],
+            txid_height_delete: vec![],
+            timestamps: vec![],
+            scripts_with_blinding_pubkey: vec![],
+            tip: default_blockheader(),
+        };
+
+        self.apply_update_inner(update, do_persist)?;
+        let final_balance = self.balance()?;
+        Ok(final_balance - initial_balance)
+    }
+
+    /// Apply an update containing blockchain data
+    ///
+    /// To update the wallet you need to first obtain the blockchain data relevant for the wallet.
+    /// This can be done using [`crate::clients::blocking::BlockchainBackend::full_scan()`], which
+    /// returns an [`crate::Update`] that contains new transaction and other data relevant for the
+    /// wallet.
+    /// The update must then be applied to the [`crate::Wollet`] so that wollet methods such as
+    /// [`crate::Wollet::balance()`] or [`crate::Wollet::transactions()`] include the new data.
+    ///
+    /// However getting blockchain data involves network calls, so between the full scan start and
+    /// when the update is applied it might elapse a significant amount of time.
+    /// In that interval, applying any update, or any transaction using [`Wollet::apply_transaction()`],
+    /// will cause this function to return a [`Error::UpdateOnDifferentStatus`].
+    /// Callers should either avoid applying updates and transactions, or they can catch the error and wait for a new full scan to be completed and applied.
     pub fn apply_update(&mut self, update: Update) -> Result<(), Error> {
         self.apply_update_inner(update, true)
     }
 
+    /// Same as [`Wollet::apply_update()`] but only apply the update in memory, without persisting it.
     pub fn apply_update_no_persist(&mut self, update: Update) -> Result<(), Error> {
         self.apply_update_inner(update, false)
     }
@@ -175,15 +271,18 @@ impl Wollet {
         let scripts_with_blinding_pubkey =
             compute_blinding_pubkey_if_missing(scripts_with_blinding_pubkey, descriptor)?;
 
-        if tip.height + 1 < store.cache.tip.0 {
-            // Checking we are not applying an old update while giving enough space for a single block reorg
-            return Err(Error::UpdateHeightTooOld {
-                update_tip_height: tip.height,
-                store_tip_height: store.cache.tip.0,
-            });
+        if tip != default_blockheader() {
+            if tip.height + 1 < store.cache.tip.0 {
+                // Checking we are not applying an old update while giving enough space for a single block reorg
+                return Err(Error::UpdateHeightTooOld {
+                    update_tip_height: tip.height,
+                    store_tip_height: store.cache.tip.0,
+                });
+            }
+
+            store.cache.tip = (tip.height, tip.block_hash());
         }
 
-        store.cache.tip = (tip.height, tip.block_hash());
         store.cache.unblinded.extend(new_txs.unblinds);
         store.cache.all_txs.extend(new_txs.txs);
         store
@@ -254,6 +353,33 @@ impl Wollet {
         }
 
         Ok(())
+    }
+
+    /// Apply a transaction to the wallet state
+    ///
+    /// Wallet transactions are normally obtained using [`crate::clients::blocking::BlockchainBackend::full_scan()`]
+    /// and applying the resulting [`crate::Update`] with [`Wollet::apply_update()`]. However a
+    /// full scan involves network calls and it can take a significant amount of time.
+    ///
+    /// If the caller does not want to wait for a full scan containing the transaction, it can
+    /// apply the transaction to the wallet state using this function.
+    ///
+    /// Note: if this transaction is *not* returned by a next full scan, after [`Wollet::apply_update()`] it will disappear from the
+    /// transactions list, will not be included in balance computations, and by the remaining
+    /// wollet methods.
+    ///
+    /// Calling this method, might cause [`Wollet::apply_update()`] to fail with a
+    /// [`Error::UpdateOnDifferentStatus`], make sure to either avoid it or handle the error properly.
+    pub fn apply_transaction(&mut self, tx: Transaction) -> Result<SignedBalance, Error> {
+        self.apply_transaction_inner(tx, true)
+    }
+
+    /// Same as [`Wollet::apply_transaction()`] but only apply the update in memory, without persisting it.
+    pub fn apply_transaction_no_persist(
+        &mut self,
+        tx: Transaction,
+    ) -> Result<SignedBalance, Error> {
+        self.apply_transaction_inner(tx, false)
     }
 }
 

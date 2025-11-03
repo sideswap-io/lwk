@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use elements::{
     confidential::{AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
     issuance::ContractHash,
-    pset::{Output, PartiallySignedTransaction, PsbtSighashType},
+    pset::{raw::ProprietaryKey, Output, PartiallySignedTransaction, PsbtSighashType},
     secp256k1_zkp::{self, ZERO_TWEAK},
     Address, AssetId, BlindAssetProofs, EcdsaSighashType, OutPoint, Script, Transaction,
 };
@@ -196,6 +196,25 @@ impl TxBuilder {
         self.add_unvalidated_recipient(&rec)
     }
 
+    /// Add explicit output
+    pub fn add_explicit_recipient(
+        mut self,
+        address: &Address,
+        satoshi: u64,
+        asset: AssetId,
+    ) -> Result<Self, Error> {
+        if address.blinding_pubkey.is_some() {
+            return Err(Error::NotExplicitAddress);
+        }
+        self.recipients.push(Recipient {
+            satoshi,
+            script_pubkey: address.script_pubkey(),
+            blinding_pubkey: None,
+            asset,
+        });
+        Ok(self)
+    }
+
     /// Fee rate in sats/kvb
     /// Multiply sats/vb value by 1000 i.e. 1.0 sat/byte = 1000.0 sat/kvb
     pub fn fee_rate(mut self, fee_rate: Option<f32>) -> Self {
@@ -331,11 +350,15 @@ impl TxBuilder {
 
     /// Switch to manual coin selection by giving a list of internal UTXOs to use.
     ///
+    /// All passed UTXOs are added to the transaction.
+    /// No other wallet UTXO is added to the transaction, caller is supposed to add enough UTXOs to
+    /// cover for all recipients and fees.
+    ///
     /// This method never fails, any error will be raised in [`TxBuilder::finish`].
     ///
     /// Possible errors:
     /// * OutPoint doesn't belong to the wallet
-    /// * The OutPoint is not L-BTC (this restriction will be removed in the future)
+    /// * Insufficient funds (remember to include L-BTC utxos for fees)
     pub fn set_wallet_utxos(mut self, utxos: Vec<OutPoint>) -> Self {
         self.selected_utxos = Some(utxos);
         self
@@ -366,7 +389,10 @@ impl TxBuilder {
     }
 
     /// Finish building a transaction that can be converted to a LiquiDEX proposal
-    fn finish_liquidex_make(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
+    fn finish_liquidex_make(
+        self,
+        wollet: &Wollet,
+    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
         // Create PSET
         let mut pset = PartiallySignedTransaction::new_v2();
         let mut inp_txout_sec = HashMap::new();
@@ -501,11 +527,15 @@ impl TxBuilder {
         // Add details to the pset from our descriptor, like bip32derivation and keyorigin
         wollet.add_details(&mut pset)?;
 
-        Ok(pset)
+        // TODO: blinding nonces
+        Ok((pset, vec![]))
     }
 
     /// Finish building a transaction that takes LiquiDEX proposals
-    fn finish_liquidex_take(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
+    fn finish_liquidex_take(
+        self,
+        wollet: &Wollet,
+    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
         let [proposal] = self.liquidex_proposals.as_slice() else {
             return Err(Error::LiquidexError(LiquidexError::TakerInvalidParams));
         };
@@ -518,6 +548,8 @@ impl TxBuilder {
         let mut last_unused_internal = wollet.change(None)?.index();
         let mut last_unused_external = wollet.address(None)?.index();
         let mut rng = thread_rng();
+
+        let utxos = wollet.utxos_map()?;
 
         let [input] = pset.inputs() else {
             return Err(Error::LiquidexError(LiquidexError::TakerInvalidParams));
@@ -575,8 +607,11 @@ impl TxBuilder {
         if maker_output_asset != wollet.policy_asset() {
             let satoshi_out = maker_output_satoshi;
             let mut satoshi_in = 0;
-            for utxo in wollet.asset_utxos(&maker_output_asset)? {
-                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &utxo)?;
+            for utxo in utxos
+                .values()
+                .filter(|u| u.unblinded.asset == maker_output_asset)
+            {
+                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
                 let surj_input = elements::SurjectionInput::from_txout_secrets(utxo.unblinded);
                 input_domain.push(surj_input.surjection_target(&EC).expect("from secrets"));
                 satoshi_in += utxo.unblinded.value;
@@ -615,8 +650,11 @@ impl TxBuilder {
         }
 
         // FIXME: For implementation simplicity now we always add all L-BTC inputs
-        for utxo in wollet.asset_utxos(&wollet.policy_asset())? {
-            wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &utxo)?;
+        for utxo in utxos
+            .values()
+            .filter(|u| u.unblinded.asset == wollet.policy_asset())
+        {
+            wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
             let surj_input = elements::SurjectionInput::from_txout_secrets(utxo.unblinded);
             input_domain.push(surj_input.surjection_target(&EC).expect("from secrets"));
             satoshi_in += utxo.unblinded.value;
@@ -704,11 +742,28 @@ impl TxBuilder {
         // Add details to the pset from our descriptor, like bip32derivation and keyorigin
         wollet.add_details(&mut pset)?;
 
-        Ok(pset)
+        // TODO: blinding nonces
+        Ok((pset, vec![]))
+    }
+
+    /// Finish building the transaction for AMP0
+    #[cfg(feature = "amp0")]
+    pub fn finish_for_amp0(self, wollet: &Wollet) -> Result<crate::amp0::Amp0Pset, Error> {
+        let (pset, blinding_nonces) = self.finish_inner(wollet, true)?;
+        crate::amp0::Amp0Pset::new(pset, blinding_nonces)
     }
 
     /// Finish building the transaction
     pub fn finish(self, wollet: &Wollet) -> Result<PartiallySignedTransaction, Error> {
+        let (pset, _blinding_nonces) = self.finish_inner(wollet, false)?;
+        Ok(pset)
+    }
+
+    fn finish_inner(
+        self,
+        wollet: &Wollet,
+        for_amp0: bool,
+    ) -> Result<(PartiallySignedTransaction, Vec<String>), Error> {
         if self.is_liquidex_make {
             return self.finish_liquidex_make(wollet);
         } else if !self.liquidex_proposals.is_empty() {
@@ -716,11 +771,23 @@ impl TxBuilder {
         }
         // Init PSET
         let mut pset = PartiallySignedTransaction::new_v2();
+
+        let genesis_block_hash = self.network().genesis_block_hash().to_byte_array().to_vec();
+        // Add genesis block hash as defined in ELIP-101 https://github.com/ElementsProject/ELIPs/blob/main/elip-0101.mediawiki
+        // TODO: upstream to rust elements
+        // TODO: tested with Jade 1.0.37 but does not work. Safe to merge because subtype is unique.
+        const PSBT_ELEMENTS_GLOBAL_GENESIS_HASH: u8 = 0x02;
+        pset.global.proprietary.insert(
+            ProprietaryKey::from_pset_pair(PSBT_ELEMENTS_GLOBAL_GENESIS_HASH, vec![]),
+            genesis_block_hash,
+        );
         let mut inp_txout_sec = HashMap::new();
-        let mut last_unused_internal = wollet.change(None)?.index();
-        let mut last_unused_external = wollet.address(None)?.index();
+        let mut last_unused_internal = wollet.last_unused_internal();
+        let mut last_unused_external = wollet.last_unused_external();
 
         let mut inp_weight = 0;
+
+        let utxos = wollet.utxos_map()?;
 
         let policy_asset = self.network().policy_asset();
         let (addressees_lbtc, addressees_asset): (Vec<_>, Vec<_>) = self
@@ -728,11 +795,28 @@ impl TxBuilder {
             .into_iter()
             .partition(|a| a.asset == policy_asset);
 
-        // Assets inputs and outputs
-        let assets: HashSet<_> = addressees_asset.iter().map(|a| a.asset).collect();
-        if !assets.is_empty() && self.selected_utxos.is_some() {
-            return Err(Error::ManualCoinSelectionOnlyLbtc);
+        // Get selected utxos (manual coin selection)
+        let mut selected_utxos = vec![];
+        if let Some(ref coins) = self.selected_utxos {
+            for coin in coins {
+                let utxo = utxos.get(coin).ok_or(Error::MissingWalletUtxo(*coin))?;
+                selected_utxos.push(utxo);
+            }
         }
+
+        // Assets that belongs to this transaction
+        // all the ones with a recipient
+        let mut assets: HashSet<_> = addressees_asset.iter().map(|a| a.asset).collect();
+        // and all the ones of utxos that are being added
+        for utxo in &self.external_utxos {
+            assets.insert(utxo.unblinded.asset);
+        }
+        for utxo in &selected_utxos {
+            assets.insert(utxo.unblinded.asset);
+        }
+        // Policy asset is handled separately below
+        assets.remove(&policy_asset);
+
         for asset in assets {
             let mut satoshi_out = 0;
             let mut satoshi_in = 0;
@@ -750,13 +834,24 @@ impl TxBuilder {
                 satoshi_in += utxo.unblinded.value;
             }
 
-            // Add more asset utxos
-            if satoshi_in < satoshi_out {
-                for utxo in wollet.asset_utxos(&asset)? {
-                    wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &utxo)?;
+            if self.selected_utxos.is_some() {
+                // Add only selected asset utxos
+                for utxo in &selected_utxos {
+                    if utxo.unblinded.asset != asset {
+                        continue;
+                    }
+                    wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
                     satoshi_in += utxo.unblinded.value;
-                    if satoshi_in >= satoshi_out {
-                        break;
+                }
+            } else {
+                // Add more asset utxos until we cover the amount to send
+                if satoshi_in < satoshi_out {
+                    for utxo in utxos.values().filter(|u| u.unblinded.asset == asset) {
+                        wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                        satoshi_in += utxo.unblinded.value;
+                        if satoshi_in >= satoshi_out {
+                            break;
+                        }
                     }
                 }
             }
@@ -797,25 +892,19 @@ impl TxBuilder {
             satoshi_in += utxo.unblinded.value;
         }
 
-        match self.selected_utxos {
-            Some(coins) => {
-                let utxos = wollet.utxos_map()?;
-
-                for coin in coins {
-                    let utxo = utxos.get(&coin).ok_or(Error::MissingWalletUtxo(coin))?;
-                    if utxo.unblinded.asset != policy_asset {
-                        return Err(Error::ManualCoinSelectionOnlyLbtc);
-                    }
-                    wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
-                    satoshi_in += utxo.unblinded.value;
+        if self.selected_utxos.is_some() {
+            for utxo in &selected_utxos {
+                if utxo.unblinded.asset != policy_asset {
+                    continue;
                 }
+                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                satoshi_in += utxo.unblinded.value;
             }
-            None => {
-                // FIXME: For implementation simplicity now we always add all L-BTC inputs
-                for utxo in wollet.asset_utxos(&wollet.policy_asset())? {
-                    wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &utxo)?;
-                    satoshi_in += utxo.unblinded.value;
-                }
+        } else {
+            // FIXME: For implementation simplicity now we always add all L-BTC inputs
+            for utxo in utxos.values().filter(|u| u.unblinded.asset == policy_asset) {
+                wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, utxo)?;
+                satoshi_in += utxo.unblinded.value;
             }
         }
 
@@ -875,7 +964,10 @@ impl TxBuilder {
                         Some((idx, u)) => (*idx, u.asset_bf),
                         None => {
                             // Add an input sending the token,
-                            let utxos_token = wollet.asset_utxos(&token)?;
+                            let utxos_token: Vec<_> = utxos
+                                .values()
+                                .filter(|u| u.unblinded.asset == token)
+                                .collect();
                             let utxo_token =
                                 utxos_token
                                     .first()
@@ -986,15 +1078,88 @@ impl TxBuilder {
         // TODO inputs/outputs(except fee) randomization, not trivial because of blinder_index on inputs
 
         // Blind the transaction
-        if self.blind {
-            let mut rng = thread_rng();
-            pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
+        let mut rng = thread_rng();
 
-            // Add details to the pset from our descriptor, like bip32derivation and keyorigin
-            wollet.add_details(&mut pset)?;
+        // TODO: use the next line once we can use elements26 only
+        // let blind_secrets = pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
+        let (blind_secrets, mut pset) = if for_amp0 {
+            use elements26::confidential::{
+                AssetBlindingFactor as Abf26, ValueBlindingFactor as Vbf26,
+            };
+            use elements26::pset::PartiallySignedTransaction as Pset26;
+            use std::str::FromStr;
+            let mut pset26 = Pset26::from_str(&pset.to_string()).expect("from elements25");
+            let inp_txout_sec: HashMap<usize, elements26::TxOutSecrets> = inp_txout_sec
+                .iter()
+                .map(|(i, s)| {
+                    let asset = elements26::AssetId::from_slice(s.asset.into_inner().as_ref())
+                        .expect("from elements25");
+                    let abf = Abf26::from_slice(s.asset_bf.into_inner().as_ref())
+                        .expect("from elements25");
+                    let vbf = Vbf26::from_slice(s.value_bf.into_inner().as_ref())
+                        .expect("from elements25");
+                    let value = s.value;
+                    let s = elements26::TxOutSecrets::new(asset, abf, value, vbf);
+                    (*i, s)
+                })
+                .collect();
+            let blind_secrets = pset26
+                .blind_last(&mut rng, &EC, &inp_txout_sec)
+                .map_err(|e| Error::Generic(format!("elements26 blind error: {}", e)))?;
+            // erase all non witness utxo surjection and range proofs
+            // this appears to be necessary for pre-segwit inputs
+            for input in pset26.inputs_mut() {
+                if let Some(ref mut tx) = &mut input.non_witness_utxo {
+                    for output in &mut tx.output {
+                        output.witness = Default::default();
+                    }
+                }
+            }
+            let pset25 = elements::pset::PartiallySignedTransaction::from_str(&pset26.to_string())
+                .expect("from elements25");
+            (blind_secrets, pset25)
+        } else {
+            let blind_secrets = std::collections::BTreeMap::new();
+            if self.blind {
+                pset.blind_last(&mut rng, &EC, &inp_txout_sec)?;
+            }
+            (blind_secrets, pset)
+        };
+
+        let mut m = HashMap::new();
+        for (ct_location, (_abf, _vbf, eph_sk)) in blind_secrets.iter() {
+            // these are outputs not inputs...
+            if let elements26::CtLocation {
+                input_index,
+                ty: elements26::CtLocationType::Input,
+            } = ct_location
+            {
+                m.insert(input_index, eph_sk);
+            }
         }
 
-        Ok(pset)
+        let mut blinding_nonces = vec![];
+        for idx in 0..pset.n_outputs() {
+            let bn = if let Some(eph_sk) = m.get(&idx) {
+                let blinding_pubkey = pset.outputs()[idx]
+                    .blinding_key
+                    .ok_or_else(|| Error::Generic("Missing blinding key".into()))?;
+                let (_nonce, shared_secret) = elements::confidential::Nonce::with_ephemeral_sk(
+                    &EC,
+                    **eph_sk,
+                    &blinding_pubkey.inner,
+                );
+                shared_secret.display_secret().to_string()
+            } else {
+                "".to_string()
+            };
+            blinding_nonces.push(bn);
+        }
+
+        // Add details to the pset from our descriptor, like bip32derivation and keyorigin
+        wollet.add_details(&mut pset)?;
+
+        Ok((pset, blinding_nonces))
     }
 }
 
@@ -1017,6 +1182,12 @@ impl<'a> WolletTxBuilder<'a> {
     /// Consume this builder and create a transaction
     pub fn finish(self) -> Result<PartiallySignedTransaction, Error> {
         self.inner.finish(self.wollet)
+    }
+
+    /// Consume this builder and create a transaction for AMP0
+    #[cfg(feature = "amp0")]
+    pub fn finish_for_amp0(self) -> Result<crate::amp0::Amp0Pset, Error> {
+        self.inner.finish_for_amp0(self.wollet)
     }
 
     /// Wrapper of [`TxBuilder::add_recipient()`]
@@ -1075,6 +1246,21 @@ impl<'a> WolletTxBuilder<'a> {
         Ok(Self {
             wollet: self.wollet,
             inner: self.inner.add_burn(satoshi, asset_id)?,
+        })
+    }
+
+    /// Wrapper of [`TxBuilder::add_explicit_recipient()`]
+    pub fn add_explicit_recipient(
+        self,
+        address: &Address,
+        satoshi: u64,
+        asset_id: AssetId,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            wollet: self.wollet,
+            inner: self
+                .inner
+                .add_explicit_recipient(address, satoshi, asset_id)?,
         })
     }
 
@@ -1173,6 +1359,7 @@ impl<'a> WolletTxBuilder<'a> {
         })
     }
 
+    /// Wrapper of [`TxBuilder::set_wallet_utxos()`]
     pub fn set_wallet_utxos(self, utxos: Vec<OutPoint>) -> Self {
         Self {
             wollet: self.wollet,
@@ -1234,5 +1421,28 @@ mod tests {
         assert!(!issuance.is_reissuance);
         assert_eq!(issuance.asset_amount, Some(1000000000));
         assert_eq!(issuance.token_amount, Some(1));
+    }
+
+    #[test]
+    fn test_serialize_proprietary_key() {
+        use elements::encode::Encodable;
+        use elements::hex::ToHex;
+        let key = elements::pset::raw::ProprietaryKey::from_pset_pair(0x02, vec![]);
+        let mut buf = vec![];
+        key.consensus_encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![4, 112, 115, 101, 116, 2]);
+        let pair = elements::pset::raw::Pair {
+            key: key.to_key(),
+            value: ElementsNetwork::Liquid
+                .genesis_block_hash()
+                .to_byte_array()
+                .to_vec(),
+        };
+        let mut buf = vec![];
+        pair.consensus_encode(&mut buf).unwrap();
+        assert_eq!(
+            buf.to_hex(),
+            "07fc047073657402200360208a889692372c8d68b084a62efdf60ea1a359a04c94b20d223658276614",
+        );
     }
 }

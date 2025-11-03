@@ -95,9 +95,11 @@ impl LiquidexTxOutSecrets {
     }
 }
 
+/// A marker type to indicate a validated [`LiquidexProposal`] proposal
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Validated;
 
+/// A marker type to indicate an unvalidated [`LiquidexProposal`] proposal
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unvalidated;
 
@@ -124,9 +126,13 @@ pub struct LiquidexProposal<S> {
     data: PhantomData<S>,
 }
 
+/// An asset identifier and an amount
 #[derive(Debug, Clone)]
 pub struct AssetAmount {
+    /// The amount of the asset in units (satoshi)
     pub amount: u64,
+
+    /// The asset identifier
     pub asset: AssetId,
 }
 

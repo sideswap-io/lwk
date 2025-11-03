@@ -29,12 +29,14 @@ impl From<&WolletDescriptor> for lwk_wollet::WolletDescriptor {
 
 #[uniffi::export]
 impl WolletDescriptor {
+    /// Create a new descriptor from its string representation.
     #[uniffi::constructor]
     pub fn new(descriptor: &str) -> Result<Arc<Self>, LwkError> {
         let inner = lwk_wollet::WolletDescriptor::from_str(descriptor)?;
         Ok(Arc::new(WolletDescriptor { inner }))
     }
 
+    /// Whether the descriptor is on the mainnet
     pub fn is_mainnet(&self) -> bool {
         self.inner.is_mainnet()
     }
@@ -53,6 +55,16 @@ impl WolletDescriptor {
             .map_err(Into::into)
             .map(Into::into)
             .map(Arc::new)
+    }
+
+    /// Whether the descriptor is AMP0
+    pub fn is_amp0(&self) -> bool {
+        self.inner.is_amp0()
+    }
+
+    /// Return the descriptor encoded so that can be part of an URL
+    pub fn url_encoded_descriptor(&self) -> String {
+        self.inner.url_encoded_descriptor()
     }
 }
 

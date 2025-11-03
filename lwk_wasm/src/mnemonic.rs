@@ -3,7 +3,9 @@ use lwk_signer::bip39;
 use std::{fmt::Display, str::FromStr};
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`bip39::Mnemonic`]
+/// A mnemonic secret code used as a master secret for a bip39 wallet.
+///
+/// Supported number of words are 12, 15, 18, 21, and 24.
 #[wasm_bindgen]
 #[derive(PartialEq, Eq, Debug)]
 pub struct Mnemonic {
@@ -31,6 +33,10 @@ impl Mnemonic {
         Ok(inner.into())
     }
 
+    /// Return the string representation of the Mnemonic.
+    /// This representation can be used to recreate the Mnemonic via `new()`
+    ///
+    /// Note this is secret information, do not log it.
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         format!("{}", self)

@@ -5,8 +5,8 @@ use lwk_wollet::elements_miniscript::psbt::finalize;
 use lwk_wollet::EC;
 use std::{fmt::Display, sync::Arc};
 
-/// Partially Signed Elements Transaction, wrapper over [`elements::pset::PartiallySignedTransaction`]
-#[derive(uniffi::Object, PartialEq, Debug)]
+/// A Partially Signed Elements Transaction
+#[derive(uniffi::Object, PartialEq, Debug, Clone)]
 #[uniffi::export(Display)]
 pub struct Pset {
     inner: PartiallySignedTransaction,
@@ -47,11 +47,29 @@ impl Pset {
         Ok(Arc::new(tx))
     }
 
+    /// Extract the Transaction from a Pset by filling in
+    /// the available signature information in place.
     pub fn extract_tx(&self) -> Result<Arc<Transaction>, LwkError> {
         let tx: Transaction = self.inner.extract_tx()?.into();
         Ok(Arc::new(tx))
     }
 
+    /// Attempt to combine with another `Pset`.
+    pub fn combine(&self, other: &Pset) -> Result<Pset, LwkError> {
+        let mut pset = self.inner.clone();
+        pset.merge(other.inner.clone())?;
+        Ok(pset.into())
+    }
+
+    /// Get the unique id of the PSET as defined by [BIP-370](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki#unique-identification)
+    ///
+    /// The unique id is the txid of the PSET with sequence numbers of inputs set to 0
+    pub fn unique_id(&self) -> Result<Txid, LwkError> {
+        let txid = self.inner.unique_id()?;
+        Ok(txid.into())
+    }
+
+    /// Return a copy of the inputs of this PSET
     pub fn inputs(&self) -> Vec<Arc<PsetInput>> {
         self.inner
             .inputs()
@@ -127,6 +145,11 @@ impl PsetInput {
             .has_issuance()
             .then(|| Arc::new(lwk_common::Issuance::new(&self.inner).into()))
     }
+
+    /// Input sighash
+    pub fn sighash(&self) -> u32 {
+        self.inner.sighash_type.map(|s| s.to_u32()).unwrap_or(1)
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +179,31 @@ mod tests {
 
         assert!(pset_in.issuance_asset().is_none());
         assert!(pset_in.issuance_token().is_none());
+    }
+
+    #[test]
+    fn pset_combine() {
+        let psets = lwk_test_util::psets_to_combine().1;
+        let psets: Vec<Pset> = psets.into_iter().map(Into::into).collect();
+        psets[0].finalize().unwrap_err(); // not enough signatures
+
+        let pset01 = psets[0].combine(&psets[1]).unwrap();
+        pset01.finalize().unwrap_err(); // not enough signatures
+        let pset012 = pset01.combine(&psets[2]).unwrap();
+        pset012.finalize().unwrap(); // enough signatures
+    }
+
+    #[test]
+    fn pset_unique_id() {
+        let psets = lwk_test_util::psets_to_combine().1;
+        let psets: Vec<Pset> = psets.into_iter().map(Into::into).collect();
+
+        let unique_id = psets[0].unique_id().unwrap();
+        for pset in psets.iter().skip(1) {
+            assert_eq!(unique_id, pset.unique_id().unwrap());
+
+            // sequence number is 0xffffffff, unique id set it to 0 before computing the hash, so txid is different
+            assert_ne!(unique_id, *pset.extract_tx().unwrap().txid());
+        }
     }
 }

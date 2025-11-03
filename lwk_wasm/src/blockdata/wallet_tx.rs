@@ -1,9 +1,9 @@
-use crate::{Error, OptionWalletTxOut, Transaction, Txid};
-use serde::Serialize;
-use serde_wasm_bindgen::Serializer;
+use crate::{Balance, OptionWalletTxOut, Transaction, Txid};
 use wasm_bindgen::prelude::*;
 
-/// Wrapper of [`lwk_wollet::WalletTx`]
+/// Value returned by asking transactions to the wallet. Contains details about a transaction
+/// from the perspective of the wallet, for example the net-balance of the transaction for the
+/// wallet.
 #[derive(Debug)]
 #[wasm_bindgen]
 pub struct WalletTx {
@@ -18,36 +18,45 @@ impl From<lwk_wollet::WalletTx> for WalletTx {
 
 #[wasm_bindgen]
 impl WalletTx {
+    /// Return a copy of the transaction.
     pub fn tx(&self) -> Transaction {
         self.inner.tx.clone().into()
     }
 
+    /// Return the height of the block containing the transaction if it's confirmed.
     pub fn height(&self) -> Option<u32> {
         self.inner.height
     }
 
-    pub fn balance(&self) -> Result<JsValue, Error> {
-        let serializer = Serializer::new().serialize_large_number_types_as_bigints(true);
-        Ok(self.inner.balance.serialize(&serializer)?)
+    /// Return the net balance of the transaction for the wallet.
+    pub fn balance(&self) -> Balance {
+        self.inner.balance.clone().into()
     }
 
+    /// Return the transaction identifier.
     pub fn txid(&self) -> Txid {
         self.inner.txid.into()
     }
 
+    /// Return the fee of the transaction.
     pub fn fee(&self) -> u64 {
         self.inner.fee
     }
 
+    /// Return the type of the transaction. Can be "issuance", "reissuance", "burn", "redeposit", "incoming", "outgoing" or "unknown".
     #[wasm_bindgen(js_name = txType)]
     pub fn tx_type(&self) -> String {
         self.inner.type_.clone()
     }
 
+    /// Return the timestamp of the block containing the transaction if it's confirmed.
     pub fn timestamp(&self) -> Option<u32> {
         self.inner.timestamp
     }
 
+    /// Return a list with the same number of elements as the inputs of the transaction.
+    /// The element in the list is a `WalletTxOut` (the output spent to create the input)
+    /// if it belongs to the wallet, while it is None for inputs owned by others
     pub fn inputs(&self) -> Vec<OptionWalletTxOut> {
         self.inner
             .inputs
@@ -57,6 +66,9 @@ impl WalletTx {
             .collect()
     }
 
+    /// Return a list with the same number of elements as the outputs of the transaction.
+    /// The element in the list is a `WalletTxOut` if it belongs to the wallet,
+    /// while it is None for inputs owned by others
     pub fn outputs(&self) -> Vec<OptionWalletTxOut> {
         self.inner
             .outputs
@@ -66,6 +78,8 @@ impl WalletTx {
             .collect()
     }
 
+    /// Return the URL to the transaction on the given explorer including the information
+    /// needed to unblind the transaction in the explorer UI.
     #[wasm_bindgen(js_name = unblindedUrl)]
     pub fn unblinded_url(&self, explorer_url: &str) -> String {
         self.inner.unblinded_url(explorer_url)
@@ -76,8 +90,7 @@ impl WalletTx {
 mod tests {
     use crate::WalletTx;
     use lwk_wollet::elements::{self, hex::FromHex, pset::serialize::Deserialize};
-    use std::collections::HashMap;
-    use std::str::FromStr;
+    use std::collections::{BTreeMap, HashMap};
     use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
@@ -112,7 +125,7 @@ mod tests {
             txid: tx.txid(),
             tx: tx.clone(),
             height: Some(4),
-            balance: vec![(a, 10)].into_iter().collect(),
+            balance: vec![(a, 10)].into_iter().collect::<BTreeMap<_, _>>().into(),
             fee: 23,
             type_: "type".to_string(),
             timestamp: Some(124),
@@ -127,7 +140,7 @@ mod tests {
         assert_eq!(wallet_tx.height(), Some(4));
 
         let balance: HashMap<elements::AssetId, i64> =
-            serde_wasm_bindgen::from_value(wallet_tx.balance().unwrap()).unwrap();
+            serde_wasm_bindgen::from_value(wallet_tx.balance().entries().unwrap()).unwrap();
         assert_eq!(balance.get(&a), Some(&10));
 
         assert_eq!(wallet_tx.fee(), 23);

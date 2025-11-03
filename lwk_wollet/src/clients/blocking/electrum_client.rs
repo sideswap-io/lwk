@@ -30,7 +30,9 @@ pub struct ElectrumClient {
 /// If you need to use tls without validating the domain, use the constructor [`ElectrumUrl`]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElectrumUrl {
-    Tls(String, bool), // the bool value indicates if the domain name should be validated
+    /// The TLS scheme with the domain name and the flag indicating if the domain name should be validated
+    Tls(String, bool),
+    /// The plaintext scheme with the domain name
     Plaintext(String),
 }
 
@@ -93,6 +95,8 @@ impl ElectrumUrl {
             Ok(ElectrumUrl::Plaintext(host_port.into()))
         }
     }
+
+    /// Build an Electrum client from the url and options
     pub fn build_client(&self, options: &ElectrumOptions) -> Result<Client, Error> {
         let builder = ConfigBuilder::new();
         let (url, builder) = match self {
@@ -119,6 +123,7 @@ impl Debug for ElectrumClient {
 /// Options for the [`ElectrumClient::with_options()`] method.
 #[derive(Default)]
 pub struct ElectrumOptions {
+    /// The timeout for the Electrum client.
     pub timeout: Option<u8>,
     pub socks5: Option<Socks5Config>,
 }
@@ -256,12 +261,14 @@ impl From<GetHistoryRes> for History {
             height: value.height,
             block_hash: None,
             block_timestamp: None,
+            v: 0,
         }
     }
 }
 
 /// Error type when parsing a string to the [`ElectrumUrl`] type.
 #[derive(thiserror::Error, Debug)]
+#[allow(missing_docs)]
 pub enum UrlError {
     #[error(transparent)]
     Url(#[from] url::ParseError),

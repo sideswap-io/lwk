@@ -14,12 +14,15 @@ use crate::{ElementsNetwork, Error, Update, WolletDescriptor};
 /// Error type for the [`Persister`] trait.
 #[derive(thiserror::Error, Debug)]
 pub enum PersistError {
+    /// Encoding error
     #[error(transparent)]
     Encoding(#[from] elements::encode::Error),
 
+    /// IO error
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    /// Other error
     #[error("{0}")]
     Other(String),
 }
@@ -52,6 +55,7 @@ sha256t_hash_newtype! {
 pub struct NoPersist {}
 
 impl NoPersist {
+    /// Create a new fake persister (implements [`Persister`] trait with empty methods thus doesn't persist anything)
     pub fn new() -> Arc<Self> {
         Arc::new(Self {})
     }

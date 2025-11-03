@@ -8,7 +8,7 @@ use crate::{
     Pset, Transaction, Wollet,
 };
 
-/// Wrapper of [`lwk_wollet::TxBuilder`]
+/// A transaction builder
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct TxBuilder {
@@ -40,6 +40,13 @@ impl TxBuilder {
     /// Build the transaction
     pub fn finish(self, wollet: &Wollet) -> Result<Pset, Error> {
         Ok(self.inner.finish(wollet.as_ref())?.into())
+    }
+
+    /// Build the transaction for AMP0
+    #[cfg(all(feature = "serial", target_arch = "wasm32"))]
+    #[wasm_bindgen(js_name = finishForAmp0)]
+    pub fn finish_for_amp0(self, wollet: &Wollet) -> Result<crate::amp0::Amp0Pset, Error> {
+        Ok(self.inner.finish_for_amp0(wollet.as_ref())?.into())
     }
 
     /// Set the fee rate
@@ -104,7 +111,32 @@ impl TxBuilder {
             .into()
     }
 
-    /// Issue an asset, wrapper of [`lwk_wollet::TxBuilder::issue_asset()`]
+    /// Add explicit recipient
+    #[wasm_bindgen(js_name = addExplicitRecipient)]
+    pub fn add_explicit_recipient(
+        self,
+        address: Address,
+        satoshi: u64,
+        asset: &AssetId,
+    ) -> Result<TxBuilder, Error> {
+        Ok(self
+            .inner
+            .add_explicit_recipient(&address.into(), satoshi, (*asset).into())?
+            .into())
+    }
+
+    /// Issue an asset
+    ///
+    /// There will be `asset_sats` units of this asset that will be received by
+    /// `asset_receiver` if it's set, otherwise to an address of the wallet generating the issuance.
+    ///
+    /// There will be `token_sats` reissuance tokens that allow token holder to reissue the created
+    /// asset. Reissuance token will be received by `token_receiver` if it's some, or to an
+    /// address of the wallet generating the issuance if none.
+    ///
+    /// If a `contract` is provided, it's metadata will be committed in the generated asset id.
+    ///
+    /// Can't be used if `reissue_asset` has been called
     #[wasm_bindgen(js_name = issueAsset)]
     pub fn issue_asset(
         self,
@@ -126,7 +158,17 @@ impl TxBuilder {
             .into())
     }
 
-    /// Reissue an asset, wrapper of [`lwk_wollet::TxBuilder::reissue_asset()`]
+    /// Reissue an asset
+    ///
+    /// reissue the asset defined by `asset_to_reissue`, provided the reissuance token is owned
+    /// by the wallet generating te reissuance.
+    ///
+    /// Generated transaction will create `satoshi_to_reissue` new asset units, and they will be
+    /// sent to the provided `asset_receiver` address if some, or to an address from the wallet
+    /// generating the reissuance transaction if none.
+    ///
+    /// If the issuance transaction does not involve this wallet,
+    /// pass the issuance transaction in `issuance_tx`.
     #[wasm_bindgen(js_name = reissueAsset)]
     pub fn reissue_asset(
         self,
@@ -146,18 +188,31 @@ impl TxBuilder {
             .into())
     }
 
-    /// Manual coin selection, wrapper of [`lwk_wollet::TxBuilder::set_wallet_utxos()`]
+    /// Switch to manual coin selection by giving a list of internal UTXOs to use.
+    ///
+    /// All passed UTXOs are added to the transaction.
+    /// No other wallet UTXO is added to the transaction, caller is supposed to add enough UTXOs to
+    /// cover for all recipients and fees.
+    ///
+    /// This method never fails, any error will be raised in [`TxBuilder::finish`].
+    ///
+    /// Possible errors:
+    /// * OutPoint doesn't belong to the wallet
+    /// * Insufficient funds (remember to include L-BTC utxos for fees)
     #[wasm_bindgen(js_name = setWalletUtxos)]
     pub fn set_wallet_utxos(self, outpoints: Vec<OutPoint>) -> TxBuilder {
         let outpoints: Vec<elements::OutPoint> = outpoints.into_iter().map(Into::into).collect();
         self.inner.set_wallet_utxos(outpoints).into()
     }
 
+    /// Return a string representation of the transaction builder (mostly for debugging)
     #[wasm_bindgen(js_name = toString)]
     pub fn to_string_js(&self) -> String {
         self.to_string()
     }
 
+    /// Set data to create a PSET from which you
+    /// can create a LiquiDEX proposal
     #[wasm_bindgen(js_name = liquidexMake)]
     pub fn liquidex_make(
         self,
@@ -172,6 +227,7 @@ impl TxBuilder {
             .into())
     }
 
+    /// Set data to take LiquiDEX proposals
     #[wasm_bindgen(js_name = liquidexTake)]
     pub fn liquidex_take(self, proposals: Vec<ValidatedLiquidexProposal>) -> Result<Self, Error> {
         let proposals: Vec<lwk_wollet::LiquidexProposal<Validated>> =

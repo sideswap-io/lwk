@@ -8,12 +8,13 @@ use crate::hashes::Hash;
 use crate::model::{Recipient, WalletTxOut};
 use crate::registry::Contract;
 use crate::wollet::Wollet;
-use crate::ElementsNetwork;
+use crate::{ElementsNetwork, EC};
 use elements::pset::elip100::{AssetMetadata, TokenMetadata};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Serialize, Deserialize)]
+const SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS: usize = 256;
+
+#[derive(Debug)]
 // We make issuance and reissuance are mutually exclusive for simplicity
 pub enum IssuanceRequest {
     None,
@@ -22,14 +23,6 @@ pub enum IssuanceRequest {
 }
 
 impl Wollet {
-    pub(crate) fn asset_utxos(&self, asset: &AssetId) -> Result<Vec<WalletTxOut>, Error> {
-        Ok(self
-            .utxos()?
-            .into_iter()
-            .filter(|utxo| &utxo.unblinded.asset == asset)
-            .collect())
-    }
-
     fn get_tx(&self, txid: &Txid) -> Result<Transaction, Error> {
         Ok(self
             .store
@@ -74,6 +67,10 @@ impl Wollet {
         inp_weight: &mut usize,
         utxo: &WalletTxOut,
     ) -> Result<usize, Error> {
+        if pset.inputs().len() >= SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS {
+            return Err(Error::TooManyInputs(pset.inputs().len()));
+        }
+
         let mut input = Input::from_prevout(utxo.outpoint);
         let mut txout = self.get_txout(&utxo.outpoint)?;
         let (Some(value_comm), Some(asset_gen)) =
@@ -107,21 +104,21 @@ impl Wollet {
 
         // Needed by ledger
         let mut rng = rand::thread_rng();
-        let secp = elements::secp256k1_zkp::Secp256k1::new();
+        let secp = &EC;
         use elements::secp256k1_zkp::{RangeProof, SurjectionProof};
         use elements::{BlindAssetProofs, BlindValueProofs};
 
         input.asset = Some(utxo.unblinded.asset);
         input.blind_asset_proof = Some(Box::new(SurjectionProof::blind_asset_proof(
             &mut rng,
-            &secp,
+            secp,
             utxo.unblinded.asset,
             utxo.unblinded.asset_bf,
         )?));
         input.amount = Some(utxo.unblinded.value);
         input.blind_value_proof = Some(Box::new(RangeProof::blind_value_proof(
             &mut rng,
-            &secp,
+            secp,
             utxo.unblinded.value,
             value_comm,
             asset_gen,
@@ -169,7 +166,7 @@ impl Wollet {
             pset.add_asset_metadata(asset, &AssetMetadata::new(contract, issuance_prevout));
             // TODO: handle blinded issuance
             let issuance_blinded = false;
-            pset.add_token_metadata(token, &TokenMetadata::new(token, issuance_blinded));
+            pset.add_token_metadata(token, &TokenMetadata::new(asset, issuance_blinded));
         }
 
         Ok((asset, token))
@@ -195,15 +192,49 @@ impl Wollet {
         Ok(())
     }
 
+    fn addressee_inner(
+        &self,
+        satoshi: u64,
+        asset: AssetId,
+        last_unused: &mut u32,
+        is_change: bool,
+    ) -> Result<Recipient, Error> {
+        #[cfg(feature = "amp0")]
+        if self.descriptor.is_amp0() {
+            // For AMP0 we never want to use addresses that are not monitored by the server.
+            // We never want to use:
+            // * index 0
+            // * indexes greater than "last_index" returned by the server
+            //
+            // GDK at login uploads 20 addresses for AMP0 accounts, so as long as we're in
+            // the [1,20] range we're fine.
+            //
+            // This is quite conservative and might cause some address reuse, but it ensures
+            // that the tx builder does not use addresses that are not monitored by the server.
+            *last_unused = (*last_unused).clamp(1, 20);
+
+            let params = self.network().address_params();
+            let address = self.descriptor.amp0_address(*last_unused, params)?;
+            *last_unused += 1;
+            return Ok(Recipient::from_address(satoshi, &address, asset));
+        }
+
+        let address = if is_change {
+            self.change(Some(*last_unused))?
+        } else {
+            self.address(Some(*last_unused))?
+        };
+        *last_unused += 1;
+        Ok(Recipient::from_address(satoshi, address.address(), asset))
+    }
+
     pub(crate) fn addressee_change(
         &self,
         satoshi: u64,
         asset: AssetId,
         last_unused: &mut u32,
     ) -> Result<Recipient, Error> {
-        let address = self.change(Some(*last_unused))?;
-        *last_unused += 1;
-        Ok(Recipient::from_address(satoshi, address.address(), asset))
+        self.addressee_inner(satoshi, asset, last_unused, true)
     }
 
     pub(crate) fn addressee_external(
@@ -212,9 +243,7 @@ impl Wollet {
         asset: AssetId,
         last_unused: &mut u32,
     ) -> Result<Recipient, Error> {
-        let address = self.address(Some(*last_unused))?;
-        *last_unused += 1;
-        Ok(Recipient::from_address(satoshi, address.address(), asset))
+        self.addressee_inner(satoshi, asset, last_unused, false)
     }
 }
 
@@ -233,7 +262,10 @@ pub(crate) fn validate_address(address: &str, network: ElementsNetwork) -> Resul
 
 #[cfg(test)]
 mod test {
-    use crate::{pset_create::validate_address, ElementsNetwork};
+    use crate::{pset_create::validate_address, ElementsNetwork, Update, WolletDescriptor};
+
+    use super::*;
+    use crate::NoPersist;
 
     #[test]
     fn test_validate() {
@@ -244,5 +276,43 @@ mod test {
 
         let network = ElementsNetwork::Liquid;
         assert!(validate_address(testnet_address, network).is_err())
+    }
+
+    #[test]
+    fn test_add_input_exceeds_limit() {
+        let wollet = test_wollet_with_many_transactions();
+
+        let mut pset = PartiallySignedTransaction::default();
+        let mut inp_txout_sec = HashMap::new();
+        let mut inp_weight = 0usize;
+        let dummy_utxo = wollet.utxos().unwrap()[0].clone();
+        for _ in 0..SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS {
+            let res = wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &dummy_utxo);
+            assert!(res.is_ok());
+        }
+        let result = wollet.add_input(&mut pset, &mut inp_txout_sec, &mut inp_weight, &dummy_utxo);
+
+        match result {
+            Err(Error::TooManyInputs(count)) => {
+                assert_eq!(count, SECP256K1_SURJECTIONPROOF_MAX_N_INPUTS);
+            }
+            _ => panic!("Expected TooManyInputs error"),
+        }
+    }
+
+    // duplicated from tests/test_wollet.rs
+    pub fn test_wollet_with_many_transactions() -> Wollet {
+        let update = lwk_test_util::update_test_vector_many_transactions();
+        let descriptor = lwk_test_util::wollet_descriptor_many_transactions();
+        let descriptor: WolletDescriptor = descriptor.parse().unwrap();
+        let update = Update::deserialize(&update).unwrap();
+        let mut wollet = Wollet::new(
+            ElementsNetwork::LiquidTestnet,
+            std::sync::Arc::new(NoPersist {}),
+            descriptor,
+        )
+        .unwrap();
+        wollet.apply_update(update).unwrap();
+        wollet
     }
 }

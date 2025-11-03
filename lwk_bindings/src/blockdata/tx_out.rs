@@ -1,9 +1,12 @@
+//! Liquid transaction output
+
 use crate::{
     types::{AssetId, SecretKey},
-    LwkError, Script, TxOutSecrets,
+    Address, LwkError, Network, Script, TxOutSecrets,
 };
 use std::sync::Arc;
 
+/// A transaction output.
 #[derive(uniffi::Object, Debug)]
 pub struct TxOut {
     inner: elements::TxOut,
@@ -40,7 +43,17 @@ impl TxOut {
 
     /// If explicit returns the value, if confidential [None]
     pub fn value(&self) -> Option<u64> {
-        self.inner.value.explicit().map(Into::into)
+        self.inner.value.explicit()
+    }
+
+    /// Unconfidential address
+    pub fn unconfidential_address(&self, network: &Network) -> Option<Arc<Address>> {
+        elements::Address::from_script(
+            &self.inner.script_pubkey,
+            None,
+            network.inner.address_params(),
+        )
+        .map(|a| Arc::new(a.into()))
     }
 
     /// Unblind the output

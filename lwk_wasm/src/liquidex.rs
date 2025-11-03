@@ -5,21 +5,30 @@ use wasm_bindgen::prelude::*;
 
 use crate::{AssetId, Pset, Transaction};
 
-/// Wrapper of [`lwk_wollet::LiquidexProposal<Unvalidated>`]
+/// LiquiDEX swap proposal
+///
+/// A LiquiDEX swap proposal is a transaction with one input and one output created by the "maker".
+/// The transaction "swaps" the input for the output, meaning that the "maker" sends the input and
+/// receives the output.
+/// However the transaction is incomplete (unbalanced and without a fee output), thus it cannot be
+/// broadcast.
+/// The "taker" can "complete" the transaction (using [`crate::TxBuilder::liquidex_take()`]) by
+/// adding more inputs and more outputs to balance the amounts, meaning that the "taker" sends the
+/// output and receives the input.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct UnvalidatedLiquidexProposal {
     inner: lwk_wollet::LiquidexProposal<Unvalidated>,
 }
 
-/// Wrapper of [`lwk_wollet::LiquidexProposal<Validated>`]
+/// Created by validating `UnvalidatedLiquidexProposal` via `validate()` or `insecure_validate()`
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct ValidatedLiquidexProposal {
     inner: lwk_wollet::LiquidexProposal<Validated>,
 }
 
-/// Wrapper of [`lwk_wollet::AssetAmount`]
+/// An asset identifier and an amount in satoshi units
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct AssetAmount {
@@ -54,12 +63,14 @@ impl UnvalidatedLiquidexProposal {
         Ok(UnvalidatedLiquidexProposal { inner })
     }
 
+    #[wasm_bindgen(js_name = fromPset)]
     pub fn from_pset(pset: Pset) -> Result<Self, crate::Error> {
         let pset = pset.into();
         let proposal = lwk_wollet::LiquidexProposal::from_pset(&pset)?;
         Ok(Self { inner: proposal })
     }
 
+    #[wasm_bindgen(js_name = insecureValidate)]
     pub fn insecure_validate(self) -> Result<ValidatedLiquidexProposal, crate::Error> {
         let inner = self.inner.insecure_validate()?;
         Ok(ValidatedLiquidexProposal { inner })
@@ -112,13 +123,12 @@ impl ValidatedLiquidexProposal {
 }
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
-    use lwk_wollet::{elements::hex::FromHex, elements_miniscript::descriptor};
     use serde_json::Value;
     use std::str::FromStr;
     use wasm_bindgen_test::*;
 
-    use super::{UnvalidatedLiquidexProposal, ValidatedLiquidexProposal};
-    use crate::{Address, Network, TxBuilder, Wollet, WolletDescriptor};
+    use super::UnvalidatedLiquidexProposal;
+    use crate::{Network, TxBuilder, Wollet, WolletDescriptor};
 
     #[wasm_bindgen_test]
     fn test_liquidex_proposal() {
@@ -177,7 +187,7 @@ mod tests {
             crate::AssetId::new("38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5")
                 .unwrap();
 
-        let mut builder = TxBuilder::new(&network);
+        let builder = TxBuilder::new(&network);
         let pset_maker = builder
             .liquidex_make(utxo, addr, 1, wanted_asset)
             .unwrap()
@@ -213,7 +223,7 @@ mod tests {
             crate::Update::deserialize_decrypted_base64(update_base64, &descriptor).unwrap();
         wollet.apply_update(&update).unwrap();
 
-        let mut builder = TxBuilder::new(&network);
+        let builder = TxBuilder::new(&network);
         let pset_taker = builder
             .liquidex_take([proposal].to_vec())
             .unwrap()
@@ -223,7 +233,6 @@ mod tests {
 
         let net_balance = wollet.pset_details(&signed_pset_taker).unwrap().balance();
 
-        // TODO why address in recipients is None?
-        assert_eq!(format!("{:?}", net_balance), "PsetBalance { inner: PsetBalance { fee: 53, balances: {144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49: 99947, 38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5: -1}, recipients: [Recipient { address: None, asset: Some(38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5), value: Some(1), vout: 0 }] } }");
+        assert_eq!(format!("{:?}", net_balance), "PsetBalance { inner: PsetBalance { fee: 53, balances: SignedBalance({144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49: 99947, 38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5: -1}), recipients: [Recipient { address: Some(tex1q0w8dczxn0rkt3jjz4ktfuu9gs5dz2p4nmhe83j), asset: Some(38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5), value: Some(1), vout: 0 }] } }");
     }
 }

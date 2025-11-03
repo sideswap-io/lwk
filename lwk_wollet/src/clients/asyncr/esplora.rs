@@ -1,8 +1,9 @@
 //! NOTE This module is temporary, as soon we make the other clients async this will be merged in
 //! the standard esplora client of which contain a lot of duplicated code.
 
-use crate::clients::LastUnused;
-use crate::clients::{try_unblind, Capability, History};
+use crate::clients::{create_dummy_tx, try_unblind, Capability, History, TokenProvider};
+use crate::clients::{EsploraClientBuilder, LastUnused};
+use crate::descriptor::url_encode_descriptor;
 use crate::BlindingPublicKey;
 use crate::{
     clients::Data,
@@ -20,8 +21,9 @@ use elements::{
 };
 use elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
 use futures::stream::{iter, StreamExt};
-use reqwest::Response;
+use reqwest::{Response, StatusCode};
 use serde::Deserialize;
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
@@ -36,19 +38,35 @@ const WATERFALLS_MAX_ADDRESSES: usize = 1_000;
 #[derive(Debug)]
 /// A blockchain backend implementation based on the
 /// [esplora HTTP API](https://github.com/blockstream/esplora/blob/master/API.md)
+/// But can also use the [waterfalls](https://github.com/RCasatta/waterfalls) endpoint to speed up the scan if supported by the server.
 pub struct EsploraClient {
     client: reqwest::Client,
     base_url: String,
     tip_hash_url: String,
     broadcast_url: String,
     waterfalls: bool,
+    pub(crate) utxo_only: bool,
     waterfalls_server_recipient: Option<Recipient>,
+
+    /// Map of a descriptor to its encrypted descriptor.
+    /// This is used to avoid encrypting the descriptor field at every requst, which cause
+    /// to have a different URL for each request (different salt) which cause http caching to be ineffective.
+    /// It's a map because the same client can be used with effectively different descriptor.
+    waterfalls_encrypted_descriptors: HashMap<String, String>,
+
     concurrency: usize,
 
     /// Avoid encrypting the descriptor field
     pub(crate) waterfalls_avoid_encryption: bool,
 
     network: ElementsNetwork,
+
+    /// Number of network requests made by this client
+    requests: AtomicUsize,
+
+    /// The token provider
+    #[allow(unused)]
+    token: TokenProvider,
 }
 
 impl EsploraClient {
@@ -56,11 +74,13 @@ impl EsploraClient {
     ///
     /// To specify different options use the [`EsploraClientBuilder`]
     pub fn new(network: ElementsNetwork, url: &str) -> Self {
-        EsploraClientBuilder::new(url, network).build()
+        EsploraClientBuilder::new(url, network)
+            .build()
+            .expect("cannot fail with this configuration")
     }
 
     pub(crate) async fn last_block_hash(&mut self) -> Result<elements::BlockHash, crate::Error> {
-        let response = get_with_retry(&self.client, &self.tip_hash_url).await?;
+        let response = self.get_with_retry(&self.tip_hash_url).await?;
         Ok(BlockHash::from_str(&response.text().await?)?)
     }
 
@@ -73,7 +93,7 @@ impl EsploraClient {
 
     async fn header(&mut self, last_block_hash: BlockHash) -> Result<elements::BlockHeader, Error> {
         let header_url = format!("{}/block/{}/header", self.base_url, last_block_hash);
-        let response = get_with_retry(&self.client, &header_url).await?;
+        let response = self.get_with_retry(&header_url).await?;
         let header_bytes = Vec::<u8>::from_hex(&response.text().await?)?;
 
         let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
@@ -88,9 +108,11 @@ impl EsploraClient {
         // TODO: check that the transaction contains some signatures
 
         let tx_hex = tx.serialize().to_hex();
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let response = self
             .client
-            .post(&self.broadcast_url)
+            .post(&self.broadcast_url) // TODO: add authorization header
             .body(tx_hex)
             .send()
             .await?;
@@ -105,12 +127,13 @@ impl EsploraClient {
 
     pub(crate) async fn get_transaction(&self, txid: Txid) -> Result<elements::Transaction, Error> {
         let tx_url = format!("{}/tx/{}/raw", self.base_url, txid);
-        let response = get_with_retry(&self.client, &tx_url).await?;
+        let response = self.get_with_retry(&tx_url).await?;
         let tx = elements::Transaction::consensus_decode(&response.bytes().await?[..])?;
 
         Ok(tx)
     }
 
+    /// Fetch concurrently a list of transactions.
     pub async fn get_transactions(
         &self,
         txids: &[Txid],
@@ -123,36 +146,43 @@ impl EsploraClient {
         results.into_iter().collect()
     }
 
+    /// Fetch concurrently a list of block headers
+    ///
+    /// Optionally pass known blockhash to avoid some network roundtrips if already known.
     pub async fn get_headers(
         &self,
         heights: &[Height],
         height_blockhash: &HashMap<Height, BlockHash>,
     ) -> Result<Vec<elements::BlockHeader>, Error> {
-        let mut result = vec![];
-        for height in heights.iter() {
-            let block_hash = match height_blockhash.get(height) {
-                Some(block_hash) => *block_hash,
-                None => {
-                    let block_height = format!("{}/block-height/{}", self.base_url, height);
-                    let response = get_with_retry(&self.client, &block_height).await?;
-                    BlockHash::from_str(&response.text().await?)?
-                }
-            };
+        let stream = iter(heights.iter().cloned())
+            .map(|height| async move {
+                let block_hash = match height_blockhash.get(&height) {
+                    Some(block_hash) => *block_hash,
+                    None => {
+                        let block_height = format!("{}/block-height/{}", self.base_url, height);
+                        let response = self.get_with_retry(&block_height).await?;
+                        BlockHash::from_str(&response.text().await?)?
+                    }
+                };
 
-            let block_header = format!("{}/block/{}/header", self.base_url, block_hash);
-            let response = get_with_retry(&self.client, &block_header).await?;
-            let header_bytes = Vec::<u8>::from_hex(&response.text().await?)?;
+                let block_header = format!("{}/block/{}/header", self.base_url, block_hash);
+                let response = self.get_with_retry(&block_header).await?;
+                let header_bytes = Vec::<u8>::from_hex(&response.text().await?)?;
 
-            let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
+                let header = elements::BlockHeader::consensus_decode(&header_bytes[..])?;
 
-            result.push(header);
-        }
-        Ok(result)
+                Ok::<elements::BlockHeader, Error>(header)
+            })
+            .buffered(self.concurrency);
+
+        let results: Vec<Result<elements::BlockHeader, Error>> = stream.collect().await;
+        results.into_iter().collect()
     }
 
     // examples:
     // https://blockstream.info/liquidtestnet/api/address/tex1qntw9m0j2e93n84x975t47ddhgkzx3x8lhfv2nj/txs
     // https://blockstream.info/liquidtestnet/api/scripthash/b50a2a798d876db54acfa0d8dfdc49154ea8defed37b225ec4c9ec7415358ba3/txs
+    /// Get the transactions involved in a list of scripts
     pub async fn get_scripts_history(
         &self,
         scripts: &[&Script],
@@ -181,7 +211,7 @@ impl EsploraClient {
         for address in addresses.iter() {
             let url = format!("{}/address/{}/txs", self.base_url, address);
             // TODO must handle paging -> https://github.com/blockstream/esplora/blob/master/API.md#addresses
-            let response = get_with_retry(&self.client, &url).await?;
+            let response = self.get_with_retry(&url).await?;
 
             // TODO going through string and then json is not as efficient as it could be but we prioritize debugging for now
             let text = response.text().await?;
@@ -204,20 +234,16 @@ impl EsploraClient {
     ) -> Result<Vec<Vec<History>>, Error> {
         let mut result = vec![];
         for address_batch in addresses.chunks(50) {
-            let url = format!("{}/v2/waterfalls", self.base_url);
-            let response = self
-                .client
-                .get(&url)
-                .query(&[(
-                    "addresses",
-                    address_batch
-                        .iter()
-                        .map(|a| a.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                )])
-                .send()
-                .await?;
+            let url = format!(
+                "{}/v2/waterfalls?addresses={}",
+                self.base_url,
+                address_batch
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let response = self.get_with_retry(&url).await?;
             let status = response.status().as_u16();
             let body = response.text().await?;
 
@@ -234,11 +260,34 @@ impl EsploraClient {
         Ok(result)
     }
 
-    /// Async version of [`crate::blocking::BlockchainBackend::full_scan()`]
+    /// Scan the blockchain for the scripts generated by a watch-only wallet
+    ///
+    /// This method scans both external and internal address chains, stopping after finding
+    /// 20 consecutive unused addresses (the gap limit) as recommended by
+    /// [BIP44](https://github.com/bitcoin/bips/blob/master/bip-0044.mediawiki#address-gap-limit).
+    ///
+    /// Returns `Some(Update)` if any changes were found during scanning, or `None` if no changes
+    /// were detected.
+    ///
+    /// To scan beyond the gap limit use [`crate::clients::blocking::BlockchainBackend::full_scan_to_index()`] instead.
     pub async fn full_scan(&mut self, wollet: &Wollet) -> Result<Option<Update>, Error> {
         self.full_scan_to_index(wollet, 0).await
     }
 
+    /// Scan the blockchain for the scripts generated by a watch-only wallet up to a specified derivation index
+    ///
+    /// While [`Self::full_scan()`] stops after finding 20 consecutive unused addresses (the gap limit),
+    /// this method will scan at least up to the given derivation index. This is useful to prevent
+    /// missing funds in cases where outputs exist beyond the gap limit.
+    ///
+    /// Will scan both external and internal address chains up to the given index for maximum safety,
+    /// even though internal addresses may not need such deep scanning.
+    ///
+    /// If transactions are found beyond the gap limit during this scan, subsequent calls to
+    /// [`Self::full_scan()`] will automatically scan up to the highest used index, preventing any
+    /// previously-found transactions from being missed.
+    ///
+    /// See [`crate::blocking::BlockchainBackend::full_scan_to_index()`] for a blocking version of this method.
     pub async fn full_scan_to_index(
         &mut self,
         wollet: &Wollet,
@@ -254,6 +303,7 @@ impl EsploraClient {
             height_blockhash,
             height_timestamp,
             tip,
+            unspent,
         } = if self.waterfalls {
             match self
                 .get_history_waterfalls(&descriptor, wollet, index)
@@ -278,9 +328,15 @@ impl EsploraClient {
         };
 
         let history_txs_id: HashSet<Txid> = txid_height.keys().cloned().collect();
-        let new_txs = self
+        let mut new_txs = self
             .download_txs(&history_txs_id, &scripts, store, &descriptor)
             .await?;
+
+        if self.utxo_only {
+            let tx = create_dummy_tx(&unspent, &new_txs);
+            new_txs.txs.push((tx.txid(), tx));
+        }
+
         let history_txs_heights_plus_tip: HashSet<Height> = txid_height
             .values()
             .filter_map(|e| *e)
@@ -429,7 +485,7 @@ impl EsploraClient {
             Some(r) => Ok(r.clone()),
             None => {
                 let url = format!("{}/v1/server_recipient", self.base_url);
-                let response = self.client.get(&url).send().await?;
+                let response = self.get_with_retry(&url).await?;
                 let status = response.status().as_u16();
                 let body = response.text().await?;
                 if status != 200 {
@@ -452,42 +508,87 @@ impl EsploraClient {
         if descriptor.is_elip151() {
             return Err(Error::UsingWaterfallsWithElip151);
         }
-        let desc = descriptor.bitcoin_descriptor_without_key_origin();
-        let desc = if self.waterfalls_avoid_encryption {
-            desc
-        } else {
-            let recipient = self.waterfalls_server_recipient().await?;
-
-            // TODO ideally the encrypted descriptor should be cached and reused, so that caching can be leveraged
-            encrypt(&desc, recipient)?
-        };
+        let base_desc = descriptor.bitcoin_descriptor_without_key_origin();
 
         let mut page = 0;
         let mut data = Data::default();
+        let mut retry_count = 0;
+        const MAX_RETRIES: usize = 1;
 
         loop {
-            let response = self
-                .client
-                .get(&descriptor_url)
-                .query(&[("descriptor", desc.clone())])
-                .query(&[("page", page.to_string())])
-                .query(&[("to_index", to_index.to_string())])
-                .send()
-                .await?;
-            let status = response.status().as_u16();
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // Log the full URL including query parameters
+            log::debug!(
+                "Requesting URL: {}?descriptor={}&page={}&to_index={}&utxo_only={}",
+                descriptor_url,
+                url_encode_descriptor(&base_desc),
+                page,
+                to_index,
+                self.utxo_only
+            );
+
+            let desc = base_desc.clone();
+            let desc = if self.waterfalls_avoid_encryption {
+                desc
+            } else {
+                match self.waterfalls_encrypted_descriptors.get(&desc) {
+                    Some(encrypted_descriptor) => encrypted_descriptor.clone(),
+                    None => {
+                        let recipient = self.waterfalls_server_recipient().await?;
+                        let encrypted_descriptor = encrypt(&desc, recipient)?;
+                        self.waterfalls_encrypted_descriptors
+                            .insert(desc, encrypted_descriptor.clone());
+                        encrypted_descriptor
+                    }
+                }
+            };
+
+            let full_url = format!(
+                "{}?descriptor={}&page={}&to_index={}&utxo_only={}",
+                descriptor_url,
+                url_encode_descriptor(&desc),
+                page,
+                to_index,
+                self.utxo_only
+            );
+            let response = self.get_with_retry(&full_url).await?;
+
+            let status = response.status();
             let body = response.text().await?;
 
-            if status != 200 {
+            if status != StatusCode::OK {
+                if status == StatusCode::UNPROCESSABLE_ENTITY && retry_count < MAX_RETRIES {
+                    // This can be caused by a change in server recipient.
+                    // Clear the recipeient and descriptor cache and force a retry
+                    self.waterfalls_encrypted_descriptors.clear();
+                    self.waterfalls_server_recipient = None;
+                    retry_count += 1;
+                    continue;
+                }
                 return Err(Error::Generic(body));
             }
 
             let waterfalls_result: WaterfallsResult = serde_json::from_str(&body)?;
 
+            if self.utxo_only {
+                let unspent = waterfalls_result
+                    .txs_seen
+                    .values()
+                    .flatten()
+                    .flatten()
+                    .map(|h| OutPoint::new(h.txid, (h.v - 1) as u32)); // TODO
+                data.unspent.extend(unspent);
+            }
+
             for (desc, chain_history) in waterfalls_result.txs_seen.iter() {
                 let desc: elements_miniscript::Descriptor<DescriptorPublicKey> = desc.parse()?;
-                let chain: Chain = (&desc)
-                    .try_into()
-                    .map_err(|_| Error::Generic("Cannot determine chain from desc".into()))?;
+
+                // NOTE: in case of descriptors without path ending, the Chain will be wrong, and the
+                // `Data::scripts` will be wrong too, this doesn't seem to impact the correctness of the scan.
+                let chain: Chain = (&desc).try_into().unwrap_or(Chain::External);
+
                 let max = chain_history
                     .iter()
                     .enumerate()
@@ -502,7 +603,7 @@ impl EsploraClient {
                         waterfalls_result.page as u32 * WATERFALLS_MAX_ADDRESSES as u32 + i as u32,
                     );
                     let ct_desc = ConfidentialDescriptor {
-                        key: descriptor.0.key.clone(),
+                        key: descriptor.as_ref().key.clone(),
                         descriptor: desc.clone(),
                     };
                     let (script, blinding_pubkey, cached) =
@@ -510,6 +611,7 @@ impl EsploraClient {
                     if !cached {
                         data.scripts.insert(script, (chain, child, blinding_pubkey));
                     }
+
                     for tx_seen in script_history {
                         let height = if tx_seen.height > 0 {
                             Some(tx_seen.height as u32)
@@ -547,10 +649,12 @@ impl EsploraClient {
         Ok(data)
     }
 
+    /// Avoid encrypting the descriptor when calling the waterfalls endpoint.
     pub fn avoid_encryption(&mut self) {
         self.waterfalls_avoid_encryption = true;
     }
 
+    /// Set the waterfalls server recipient key. This is used to encrypt the descriptor when calling the waterfalls endpoint.
     pub fn set_waterfalls_server_recipient(&mut self, recipient: Recipient) {
         self.waterfalls_server_recipient = Some(recipient);
     }
@@ -588,7 +692,7 @@ impl EsploraClient {
                             let vout = i as u32;
                             let outpoint = OutPoint { txid, vout };
 
-                            match try_unblind(output.clone(), descriptor) {
+                            match try_unblind(output, descriptor) {
                                     Ok(unblinded) => unblinds.push((outpoint, unblinded)),
                                     Err(_) => log::info!("{} cannot unblind, ignoring (could be sender messed up with the blinding process)", outpoint),
                                 }
@@ -641,6 +745,7 @@ impl EsploraClient {
         Ok(result)
     }
 
+    #[allow(unused)]
     pub(crate) fn capabilities(&self) -> HashSet<Capability> {
         if self.waterfalls {
             vec![Capability::Waterfalls].into_iter().collect()
@@ -648,70 +753,101 @@ impl EsploraClient {
             HashSet::new()
         }
     }
-}
 
-/// A builder for the [`EsploraClient`]
-pub struct EsploraClientBuilder {
-    base_url: String,
-    waterfalls: bool,
-    network: ElementsNetwork,
-    headers: HashMap<String, String>,
-    timeout: Option<u8>,
-    concurrency: Option<usize>,
+    /// Return the number of network requests made by this client.
+    pub fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn get_with_retry(&self, url: &str) -> Result<Response, Error> {
+        let mut attempt = 0;
+        loop {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let builder = self.client.get(url);
+            let builder = match &self.token {
+                TokenProvider::None => builder,
+                TokenProvider::Static(token) => {
+                    builder.header("Authorization", format!("Bearer {token}"))
+                }
+                TokenProvider::Blockstream {
+                    url,
+                    client_id,
+                    client_secret,
+                } => {
+                    let token_response: serde_json::Value = self
+                        .client
+                        .post(url)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .form(&[
+                            ("client_id", client_id.as_str()),
+                            ("client_secret", client_secret.as_str()),
+                            ("grant_type", "client_credentials"),
+                            ("scope", "openid"),
+                        ])
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+
+                    let token = token_response["access_token"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            Error::Generic("Missing access_token in response".to_string())
+                        })?
+                        .to_string();
+                    // TODO: store the token and the expiration time
+                    // and refresh it only if it's expired
+                    builder.header("Authorization", format!("Bearer {token}"))
+                }
+            };
+            let response = builder.send().await?;
+
+            let level = if response.status() == 200 {
+                log::Level::Trace
+            } else {
+                log::Level::Info
+            };
+            log::log!(
+                level,
+                "{} status_code:{} - body bytes:{:?}",
+                &url,
+                response.status(),
+                response.content_length(),
+            );
+
+            // 429 Too many requests
+            // 503 Service Temporarily Unavailable
+            if response.status() == 429 || response.status() == 503 {
+                if attempt > 6 {
+                    log::warn!("{url} tried 6 times, failing");
+                    return Err(Error::Generic("Too many retry".to_string()));
+                }
+                let secs = 1 << attempt;
+
+                log::debug!("{url} waiting {secs}");
+
+                async_sleep(secs * 1000).await;
+                attempt += 1;
+            } else {
+                return Ok(response);
+            }
+        }
+    }
 }
 
 impl EsploraClientBuilder {
-    /// Create a new [`EsploraClientBuilder`]
-    pub fn new(base_url: &str, network: ElementsNetwork) -> Self {
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            waterfalls: false,
-            network,
-            headers: HashMap::new(),
-            timeout: None,
-            concurrency: None,
-        }
-    }
-
-    /// If `waterfalls` is true, it expects the server support the descriptor endpoint, which avoids several roundtrips
-    /// during the scan and for this reason is much faster. To achieve so, the "bitcoin descriptor" part is shared with
-    /// the server. All of the address are shared with the server anyway even without the waterfalls scan, but in
-    /// separate calls, and in this case future addresses cannot be derived.
-    /// In both cases, the server can see transactions that are involved in the wallet but it knows nothing about the
-    /// assets and amount exchanged due to the nature of confidential transactions.
-    pub fn waterfalls(mut self, waterfalls: bool) -> Self {
-        self.waterfalls = waterfalls;
-        self
-    }
-
-    /// Set a timeout in seconds for requests
-    pub fn timeout(mut self, timeout: u8) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Set the concurrency level for requests, default is 1.
-    /// Concurrency can't be 0, if 0 is passed 1 will be used.
-    pub fn concurrency(mut self, concurrency: usize) -> Self {
-        self.concurrency = Some(concurrency.max(1)); // 0 would hang the executor
-        self
-    }
-
-    /// Set the HTTP request headers for each request
-    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
-        self.headers = headers;
-        self
-    }
-
-    /// Add a HTTP header to set on each request
-    pub fn header(mut self, key: String, val: String) -> Self {
-        self.headers.insert(key, val);
-        self
-    }
-
     /// Consume the builder and build a new [`EsploraClient`]
-    pub fn build(self) -> EsploraClient {
+    pub fn build(self) -> Result<EsploraClient, Error> {
+        if !self.waterfalls && self.utxo_only {
+            return Err(Error::Generic(
+                "UTXO only can be used only with waterfalls".to_string(),
+            ));
+        }
         let headers = (&self.headers).try_into().expect("Expected valid headers");
+        #[cfg(target_arch = "wasm32")]
+        let builder = reqwest::Client::builder().default_headers(headers);
+        #[cfg(not(target_arch = "wasm32"))]
         let mut builder = reqwest::Client::builder().default_headers(headers);
         // See https://github.com/seanmonstar/reqwest/issues/1135
         #[cfg(not(target_arch = "wasm32"))]
@@ -719,59 +855,27 @@ impl EsploraClientBuilder {
             builder = builder.timeout(std::time::Duration::from_secs(timeout as u64));
         }
         let client = builder.build().expect("Failed to create client"); // TODO: handle error but note that this is equivalent to the new() which panics
-        EsploraClient {
+        Ok(EsploraClient {
             client,
             base_url: self.base_url.clone(),
             tip_hash_url: format!("{}/blocks/tip/hash", self.base_url),
             broadcast_url: format!("{}/tx", self.base_url),
             waterfalls: self.waterfalls,
+            utxo_only: self.utxo_only,
             waterfalls_server_recipient: None,
             waterfalls_avoid_encryption: false,
             network: self.network,
             concurrency: self.concurrency.unwrap_or(1),
-        }
-    }
-}
-
-async fn get_with_retry(client: &reqwest::Client, url: &str) -> Result<Response, Error> {
-    let mut attempt = 0;
-    loop {
-        let response = client.get(url).send().await?;
-
-        let level = if response.status() == 200 {
-            log::Level::Trace
-        } else {
-            log::Level::Info
-        };
-        log::log!(
-            level,
-            "{} status_code:{} - body bytes:{:?}",
-            &url,
-            response.status(),
-            response.content_length(),
-        );
-
-        // 429 Too many requests
-        // 503 Service Temporarily Unavailable
-        if response.status() == 429 || response.status() == 503 {
-            if attempt > 6 {
-                log::warn!("{url} tried 6 times, failing");
-                return Err(Error::Generic("Too many retry".to_string()));
-            }
-            let secs = 1 << attempt;
-
-            log::debug!("{url} waiting {secs}");
-
-            async_sleep(secs * 1000).await;
-            attempt += 1;
-        } else {
-            return Ok(response);
-        }
+            requests: AtomicUsize::new(0),
+            waterfalls_encrypted_descriptors: HashMap::new(),
+            token: self.token,
+        })
     }
 }
 
 // based on https://users.rust-lang.org/t/rust-wasm-async-sleeping-for-100-milli-seconds-goes-up-to-1-minute/81177
 // TODO remove/handle/justify unwraps
+/// Async sleep
 #[cfg(target_arch = "wasm32")]
 pub async fn async_sleep(millis: i32) {
     let mut cb = |resolve: js_sys::Function, _reject: js_sys::Function| {
@@ -784,6 +888,7 @@ pub async fn async_sleep(millis: i32) {
     wasm_bindgen_futures::JsFuture::from(p).await.unwrap();
 }
 #[cfg(not(target_arch = "wasm32"))]
+/// Sleep asynchronously for the given number of milliseconds on non-WASM targets.
 pub async fn async_sleep(millis: i32) {
     tokio::time::sleep(tokio::time::Duration::from_millis(millis as u64)).await;
 }
@@ -795,6 +900,7 @@ impl From<EsploraTx> for History {
             height: value.status.block_height.unwrap_or(-1),
             block_hash: value.status.block_hash,
             block_timestamp: None,
+            v: 0,
         }
     }
 }
@@ -844,15 +950,19 @@ fn encrypt(plaintext: &str, recipient: Recipient) -> Result<String, Error> {
 mod tests {
     use std::{collections::HashMap, str::FromStr};
 
-    use crate::{clients::asyncr::async_sleep, ElementsNetwork};
+    use crate::{
+        asyncr::EsploraClientBuilder,
+        clients::{asyncr::async_sleep, TokenProvider},
+        ElementsNetwork,
+    };
 
     use super::EsploraClient;
     use elements::{encode::Decodable, BlockHash};
 
     async fn get_block(base_url: &str, hash: BlockHash) -> elements::Block {
         let url = format!("{}/block/{}/raw", base_url, hash);
-        let client = reqwest::Client::new();
-        let response = super::get_with_retry(&client, &url).await.unwrap();
+        let client = EsploraClient::new(ElementsNetwork::Liquid, base_url);
+        let response = client.get_with_retry(&url).await.unwrap();
         elements::Block::consensus_decode(&response.bytes().await.unwrap()[..]).unwrap()
     }
 
@@ -931,5 +1041,66 @@ mod tests {
             .await
             .unwrap();
         assert!(!histories.is_empty())
+    }
+
+    #[test]
+    fn test_esplora_client_builder_error() {
+        let client = crate::asyncr::EsploraClientBuilder::new("", ElementsNetwork::Liquid)
+            .waterfalls(false)
+            .utxo_only(true)
+            .build();
+        assert!(client.is_err());
+    }
+
+    #[ignore = "requires internet connection and env vars"]
+    #[tokio::test]
+    async fn esplora_authenticated() {
+        let client_id = std::env::var("CLIENT_ID").unwrap();
+        let client_secret = std::env::var("CLIENT_SECRET").unwrap();
+        let staging_login = "https://login.staging.blockstream.com/realms/blockstream-public/protocol/openid-connect/token";
+
+        let token_response: serde_json::Value = reqwest::Client::new()
+            .post(staging_login)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("grant_type", "client_credentials"),
+                ("scope", "openid"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let token_id = token_response["access_token"].as_str().unwrap().to_string();
+
+        let mut client = EsploraClientBuilder::new(
+            "https://enterprise.staging.blockstream.info/liquid/api",
+            ElementsNetwork::Liquid,
+        )
+        .token(TokenProvider::Static(token_id))
+        .build()
+        .unwrap();
+
+        let tip = client.tip().await.unwrap();
+        assert!(tip.height > 100);
+
+        let mut client = EsploraClientBuilder::new(
+            "https://enterprise.staging.blockstream.info/liquid/api",
+            ElementsNetwork::Liquid,
+        )
+        .token(TokenProvider::Blockstream {
+            url: staging_login.to_string(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+        })
+        .build()
+        .unwrap();
+
+        let tip = client.tip().await.unwrap();
+        assert!(tip.height > 100);
     }
 }
