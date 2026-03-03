@@ -53,6 +53,8 @@ impl Debug for ElectrumClient {
 pub struct ElectrumOptions {
     /// The timeout for the Electrum client.
     pub timeout: Option<u8>,
+    /// Use SOCKS
+    pub socks5: Option<electrum_client::Socks5Config>,
 }
 
 impl ElectrumClient {
@@ -70,6 +72,9 @@ impl ElectrumClient {
         let mut builder = ElectrumClientBuilder::new(&url.to_string());
         if let Some(timeout) = options.timeout {
             builder = builder.timeout(Duration::from_secs(timeout as u64));
+        }
+        if let Some(socks5) = options.socks5 {
+            builder = builder.proxy(Some(socks5));
         }
         builder.build()
     }
@@ -159,6 +164,7 @@ pub struct ElectrumClientBuilder {
     timeout: Option<Duration>,
     token_provider: TokenProvider,
     allow_plaintext_with_token: bool,
+    socks5: Option<electrum_client::Socks5Config>,
 }
 
 impl ElectrumClientBuilder {
@@ -170,6 +176,7 @@ impl ElectrumClientBuilder {
             timeout: None,
             token_provider: TokenProvider::None,
             allow_plaintext_with_token: false,
+            socks5: None,
         }
     }
 
@@ -218,6 +225,12 @@ impl ElectrumClientBuilder {
         self
     }
 
+    /// SIDESWAP: Use optional Socks proxy
+    pub fn proxy(mut self, socks5: Option<electrum_client::Socks5Config>) -> Self {
+        self.socks5 = socks5;
+        self
+    }
+
     /// Build the [`ElectrumClient`], opening the connection.
     pub fn build(self) -> Result<ElectrumClient, Error> {
         let url: ElectrumUrl = self.url.parse()?;
@@ -230,7 +243,8 @@ impl ElectrumClientBuilder {
             ));
         }
         let auth = token_provider_auth(&self.token_provider)?;
-        let client = url.build_client_inner(self.timeout, auth.provider, auth.retry)?;
+        let client =
+            url.build_client_inner(self.timeout, auth.provider, auth.retry, self.socks5)?;
         let header = client.block_headers_subscribe_raw()?;
         let tip: BlockHeader = elements_deserialize(&header.header)?;
 
@@ -343,6 +357,7 @@ impl ElectrumUrl {
             options.timeout.map(|t| Duration::from_secs(t as u64)),
             None,
             None,
+            options.socks5.clone(),
         )
     }
 
@@ -353,6 +368,7 @@ impl ElectrumUrl {
         timeout: Option<Duration>,
         auth_provider: Option<AuthProvider>,
         retry: Option<u8>,
+        socks5: Option<electrum_client::Socks5Config>,
     ) -> Result<Client, Error> {
         let builder = ConfigBuilder::new();
         let (url, builder) = match self {
@@ -363,6 +379,7 @@ impl ElectrumUrl {
         };
         let mut builder = builder
             .timeout(timeout)
+            .socks5(socks5)
             .authorization_provider(auth_provider);
         if let Some(retry) = retry {
             builder = builder.retry(retry);
