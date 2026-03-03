@@ -36,6 +36,8 @@ impl Debug for ElectrumClient {
 pub struct ElectrumOptions {
     /// The timeout for the Electrum client.
     pub timeout: Option<u8>,
+    /// Use SOCKS
+    pub socks5: Option<electrum_client::Socks5Config>,
 }
 
 impl ElectrumClient {
@@ -186,7 +188,9 @@ impl ElectrumUrl {
             }
             ElectrumUrl::Plaintext(url) => (format!("tcp://{url}"), builder),
         };
-        let builder = builder.timeout(options.timeout);
+        let builder = builder
+            .timeout(options.timeout)
+            .socks5(options.socks5.clone());
         Ok(Client::from_config(&url, builder.build())?)
     }
 }
