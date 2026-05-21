@@ -54,7 +54,10 @@ pub struct Wollet {
 
     /// cached value
     max_weight_to_satisfy: usize,
+
     utxo_only: bool,
+
+    allow_explicit: bool,
 }
 
 /// A builder for constructing [`Wollet`] instances
@@ -70,6 +73,7 @@ pub struct WolletBuilder {
     txs_store: Arc<dyn DynStore>,
     encrypt_txs_store: Option<bool>,
     utxo_only: bool,
+    allow_explicit: bool,
 }
 
 impl WolletBuilder {
@@ -85,6 +89,7 @@ impl WolletBuilder {
             encrypt_txs_store: None,
             merge_threshold: None,
             utxo_only: false,
+            allow_explicit: false,
         }
     }
 
@@ -200,6 +205,12 @@ impl WolletBuilder {
         Ok(self)
     }
 
+    /// If true, reported transaction balances will include explicit outputs. The default is false.
+    pub fn with_allow_explicit(mut self, value: bool) -> Self {
+        self.allow_explicit = value;
+        self
+    }
+
     /// Build the `Wollet`
     pub fn build(self) -> Result<Wollet, Error> {
         if self.txs_store.is_persisted() && self.merge_threshold != Some(1) {
@@ -247,6 +258,7 @@ impl WolletBuilder {
             updates_persister,
             max_weight_to_satisfy,
             utxo_only: self.utxo_only,
+            allow_explicit: self.allow_explicit,
         };
 
         wollet.restore_updates()?;
@@ -958,7 +970,7 @@ impl Wollet {
                 .tx(txid)
                 .ok_or_else(|| Error::Generic(format!("list_tx no tx {txid}")))?;
 
-            let balance = tx_balance(*txid, &tx, &txos);
+            let balance = tx_balance(*txid, &tx, &txos, self.allow_explicit);
             let inputs = tx_inputs(&tx, &txos);
             let outputs = tx_outputs(*txid, &tx, &txos);
             if balance.is_empty()
@@ -1003,7 +1015,7 @@ impl Wollet {
         if let Some(tx) = self.cache.tx(txid) {
             let txos = self.txos_map()?;
 
-            let balance = tx_balance(*txid, &tx, &txos);
+            let balance = tx_balance(*txid, &tx, &txos, self.allow_explicit);
             let fee = tx_fee(&tx);
             let policy_asset = self.policy_asset();
             let type_ = tx_type(&tx, &policy_asset, &balance, fee);
@@ -1250,20 +1262,21 @@ fn tx_balance(
     txid: Txid,
     tx: &Transaction,
     txos: &HashMap<OutPoint, WalletTxOut>,
+    allow_explicit: bool,
 ) -> BTreeMap<AssetId, i64> {
     debug_assert_eq!(txid, tx.txid());
     let mut balance = BTreeMap::new();
 
     for out_idx in 0..tx.output.len() {
         if let Some(txout) = txos.get(&OutPoint::new(txid, out_idx as u32)) {
-            if !is_explicit(&txout.unblinded) {
+            if allow_explicit || !is_explicit(&txout.unblinded) {
                 *balance.entry(txout.unblinded.asset).or_default() += txout.unblinded.value as i64;
             }
         }
     }
     for input in &tx.input {
         if let Some(txout) = txos.get(&input.previous_output) {
-            if !is_explicit(&txout.unblinded) {
+            if allow_explicit || !is_explicit(&txout.unblinded) {
                 *balance.entry(txout.unblinded.asset).or_default() -= txout.unblinded.value as i64;
             }
         }
