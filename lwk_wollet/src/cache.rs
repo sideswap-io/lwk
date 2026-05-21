@@ -22,10 +22,10 @@ fn tx_key(txid: &Txid) -> String {
 /// It is fully reconstructable from the CT Descriptor and the blockchain.
 pub struct Cache {
     /// Store for all wallet transactions
-    txs_store: Arc<dyn DynStore>,
+    pub txs_store: Arc<dyn DynStore>,
 
     /// all txids in txs_store
-    txids: HashSet<Txid>,
+    pub txids: HashSet<Txid>,
 
     /// contains all my script up to an empty batch of BATCHSIZE
     pub paths: HashMap<Script, (Chain, ChildNumber)>,
@@ -34,16 +34,16 @@ pub struct Cache {
     pub scripts: HashMap<(Chain, ChildNumber), (Script, Option<BlindingPublicKey>)>,
 
     /// contains only my wallet txs with the relative heights (None if unconfirmed)
-    heights: HashMap<Txid, Option<Height>>,
+    pub heights: HashMap<Txid, Option<Height>>,
 
     /// txids sorted by height descending, then txid descending (unconfirmed first)
-    sorted_txids: Vec<Txid>,
+    pub sorted_txids: Vec<Txid>,
 
     /// Wallet unspent outpoints and their script pubkeys
-    unspent: HashMap<OutPoint, Script>,
+    pub unspent: HashMap<OutPoint, Script>,
 
     /// unblinded values
-    unblinded: HashMap<OutPoint, TxOutSecrets>,
+    pub unblinded: HashMap<OutPoint, TxOutSecrets>,
 
     /// height and hash of tip of the blockchain
     pub tip: (Height, BlockHash),
