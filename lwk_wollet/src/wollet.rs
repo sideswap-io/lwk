@@ -755,7 +755,8 @@ impl Wollet {
         self.txos_inner()
     }
 
-    pub(crate) fn txos_map(&self) -> Result<HashMap<OutPoint, WalletTxOut>, Error> {
+    /// Return all TXOs
+    pub fn txos_map(&self) -> Result<HashMap<OutPoint, WalletTxOut>, Error> {
         Ok(self
             .txos_inner()?
             .into_iter()
@@ -1022,6 +1023,38 @@ impl Wollet {
             let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
             let inputs = tx_inputs(&tx, &txos);
             let outputs = tx_outputs(*txid, &tx, &txos);
+
+            Ok(Some(WalletTx {
+                tx,
+                txid: *txid,
+                height: *height,
+                balance: balance.into(),
+                fee,
+                type_,
+                timestamp,
+                inputs,
+                outputs,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// SIDESWAP: A copy of fn transaction(...) that accepts txos
+    pub fn transaction_(
+        &self,
+        txid: &Txid,
+        txos: &HashMap<OutPoint, WalletTxOut>,
+    ) -> Result<Option<WalletTx>, Error> {
+        let height = self.cache.tx_height(txid).unwrap_or(&None);
+        if let Some(tx) = self.cache.tx(txid) {
+            let balance = tx_balance(*txid, &tx, txos, self.allow_explicit);
+            let fee = tx_fee(&tx);
+            let policy_asset = self.policy_asset();
+            let type_ = tx_type(&tx, &policy_asset, &balance, fee);
+            let timestamp = height.and_then(|h| self.cache.timestamps.get(&h).cloned());
+            let inputs = tx_inputs(&tx, txos);
+            let outputs = tx_outputs(*txid, &tx, txos);
 
             Ok(Some(WalletTx {
                 tx,
