@@ -655,7 +655,7 @@ impl Wollet {
                 .cache
                 .get_unblinded(outpoint)
                 .ok_or_else(|| Error::Generic("missing unblinded".into()))?;
-            if is_explicit(&unblinded) {
+            if is_explicit(&unblinded) && !self.allow_explicit {
                 continue;
             }
             let height = self.cache.tx_height(&outpoint.txid).unwrap_or(&None);
