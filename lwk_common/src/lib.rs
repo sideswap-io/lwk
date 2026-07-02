@@ -75,7 +75,6 @@ pub trait Stream {
     fn write(&self, data: &[u8]) -> impl std::future::Future<Output = Result<(), Self::Error>>;
 }
 
-use elements::confidential::{Asset, Value};
 use elements_miniscript::confidential::bare::tweak_private_key;
 use elements_miniscript::confidential::Key;
 use elements_miniscript::descriptor::DescriptorSecretKey;
@@ -228,19 +227,29 @@ pub fn pset_balance(
                     }
                 }
 
-                // We expect the input to be blinded
-                let (asset_comm, amount_comm) = match (txout.asset, txout.value) {
-                    (Asset::Confidential(g), Value::Confidential(c)) => (g, c),
-                    _ => return Err(Error::InputNotBlinded { idx }),
-                };
+                // SIDESWAP: Allow explicit inputs
+                // // We expect the input to be blinded
+                // let (asset_comm, amount_comm) = match (txout.asset, txout.value) {
+                //     (Asset::Confidential(g), Value::Confidential(c)) => (g, c),
+                //     _ => return Err(Error::InputNotBlinded { idx }),
+                // };
 
                 let (asset, value) = match (
                     input.blind_asset_proof.as_ref(),
                     input.blind_value_proof.as_ref(),
                     input.asset,
                     input.amount,
+                    txout.asset.commitment(),
+                    txout.value.commitment(),
                 ) {
-                    (Some(bap), Some(bvp), Some(asset), Some(value)) => {
+                    (
+                        Some(bap),
+                        Some(bvp),
+                        Some(asset),
+                        Some(value),
+                        Some(asset_comm),
+                        Some(amount_comm),
+                    ) => {
                         if !bap.blind_asset_proof_verify(&secp, asset, asset_comm) {
                             return Err(Error::InvalidAssetBlindProof { idx });
                         }
@@ -249,7 +258,7 @@ pub fn pset_balance(
                         }
                         (asset, value)
                     }
-                    _ => {
+                    (_, _, _, _, Some(asset_comm), Some(amount_comm)) => {
                         // To handle PSETs created before we started adding input blind proofs,
                         // we also try to unblind the input with the descriptor blinding key
                         let private_blinding_key =
@@ -271,6 +280,9 @@ pub fn pset_balance(
                         }
                         (txout_secrets.asset, txout_secrets.value)
                     }
+                    // SIDESWAP: Allow spending explicit inputs
+                    (None, None, Some(asset), Some(value), None, None) => (asset, value),
+                    _ => return Err(Error::InputNotBlinded { idx }),
                 };
 
                 *balances.entry(asset).or_default() -= value as i64;
@@ -362,6 +374,10 @@ pub fn pset_balance(
                     return Err(Error::OutputCommitmentsMismatch { idx });
                 }
 
+                *balances.entry(asset).or_default() += amount as i64;
+            }
+            // SIDESWAP: Allow unblinded outputs
+            (Some(asset), None, None, Some(amount), None, None) => {
                 *balances.entry(asset).or_default() += amount as i64;
             }
             _ => return Err(Error::OutputNotBlinded { idx }),
