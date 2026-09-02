@@ -43,6 +43,15 @@ pub struct Cache {
     /// Wallet unspent outpoints and their script pubkeys
     pub unspent: HashMap<OutPoint, Script>,
 
+    /// For every outpoint spent by a transaction that passed through this cache, the
+    /// txids of the transactions spending it. Built from transaction bodies as they are
+    /// added (see [`Self::extend_all_txs`]) and never pruned; whether a spend is LIVE is
+    /// decided by the spender still being in `heights`. This is what makes the unspent
+    /// set independent of the order and batching of updates: an output is unspent only
+    /// while no live wallet transaction spends it, regardless of which update mentions
+    /// which txid.
+    spent_by: HashMap<OutPoint, HashSet<Txid>>,
+
     /// unblinded values
     pub unblinded: HashMap<OutPoint, TxOutSecrets>,
 
@@ -76,6 +85,7 @@ impl Default for Cache {
             heights: HashMap::default(),
             sorted_txids: vec![],
             unspent: HashMap::new(),
+            spent_by: HashMap::default(),
             unblinded: HashMap::default(),
             cannot_unblind_txids: HashSet::default(),
             tip: (0, BlockHash::all_zeros()),
@@ -326,6 +336,31 @@ impl Cache {
         self.sorted_txids = sorted;
     }
 
+    /// Whether `outpoint` is spent by a wallet transaction that is currently live
+    /// (present in `heights`, i.e. seen and not deleted).
+    fn spent_by_live_tx(&self, outpoint: &OutPoint) -> bool {
+        self.spent_by
+            .get(outpoint)
+            .is_some_and(|spenders| spenders.iter().any(|t| self.heights.contains_key(t)))
+    }
+
+    /// Maintain the unspent set from a delta update.
+    ///
+    /// Updates list a txid whenever its HEIGHT changes, not only when it is first seen,
+    /// and a scan of a busy wallet is not an atomic snapshot: a block can land between
+    /// the history fetches of two scripts, so a child can be reported confirmed while
+    /// its parent is still reported unconfirmed. On the next scan the parent is listed
+    /// alone (its height changed) and the child is not (its height is final). Re-adding
+    /// the parent's outputs and removing only the inputs of the transactions in THIS
+    /// update then resurrects the output the child spent — permanently, because the
+    /// child is never listed again. Found by `fuzz_incremental_unspent_matches_derived`
+    /// (seed 0, four steps in) after SideSwap customers saw balances too high by
+    /// outputs spent months earlier.
+    ///
+    /// So a re-added output is checked against every live spender the cache knows
+    /// (`spent_by`), not just the transactions carried by the update, and the whole set
+    /// is swept against live spenders at the end so a phantom that reached persisted
+    /// state heals on the next update or restore.
     fn update_unspent(
         &mut self,
         txid_height_new: &[(Txid, Option<u32>)],
@@ -338,6 +373,7 @@ impl Cache {
             .unblinded
             .keys()
             .filter(|op| txids_new.contains(&op.txid))
+            .filter(|op| !self.spent_by_live_tx(op))
             .filter_map(|op| {
                 self.outpoint_script(op, new_txs)
                     .map(|script| (*op, script))
@@ -358,6 +394,8 @@ impl Cache {
             .filter_map(|txid| self.tx_as_fallback(txid, new_txs))
             .flat_map(|tx| tx.input.into_iter().map(|i| i.previous_output))
             .filter(|op| self.unblinded.contains_key(op))
+            // another live transaction may spend the same output (a replacement)
+            .filter(|op| !self.spent_by_live_tx(op))
             .filter_map(|op| {
                 self.outpoint_script(&op, new_txs)
                     .map(|script| (op, script))
@@ -375,6 +413,17 @@ impl Cache {
         // by another deleted tx does not remain in unspent)
         self.unspent
             .retain(|o, _| deleted_txids.iter().all(|txid| txid != &o.txid));
+        // Sweep: nothing spent by a live wallet transaction is unspent, whatever the
+        // history of updates that led here. Heals persisted phantoms on restore.
+        let phantoms: Vec<OutPoint> = self
+            .unspent
+            .keys()
+            .filter(|op| self.spent_by_live_tx(op))
+            .copied()
+            .collect();
+        for op in phantoms {
+            self.unspent.remove(&op);
+        }
     }
 
     fn update_unspent_from_snapshot(
@@ -480,6 +529,12 @@ impl Cache {
                 .put(&tx_key(txid), &elements::encode::serialize(tx))
                 .map_err(Error::StoreError)?;
             self.txids.insert(*txid);
+            for input in &tx.input {
+                self.spent_by
+                    .entry(input.previous_output)
+                    .or_default()
+                    .insert(*txid);
+            }
         }
         if !txs.is_empty() {
             // TODO: order keys
@@ -629,5 +684,303 @@ mod tests {
             .unwrap();
 
         assert_eq!(live.all_txids(), restored.all_txids());
+    }
+
+    /// The incremental `unspent` set must equal the set DERIVED from the
+    /// wallet's transactions (owned outputs minus inputs of known txs), for
+    /// any scan-shaped sequence of updates: txs first seen unconfirmed or
+    /// confirmed, confirmed later, chained on unconfirmed parents, dropped
+    /// from the mempool and re-added. Also: replaying the recorded updates
+    /// into a fresh cache (a restore) must reach the same set.
+    #[test]
+    fn fuzz_incremental_unspent_matches_derived() {
+        use crate::descriptor::Chain;
+        use crate::elements::TxOutSecrets;
+        use crate::hashes::Hash as _;
+        use elements::bitcoin::bip32::ChildNumber;
+        use elements::confidential::{
+            Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor,
+        };
+        use elements::{AssetId, OutPoint, Sequence, TxIn, TxOut};
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::collections::HashSet;
+
+        struct SimTx {
+            tx: Transaction,
+            height: Option<u32>,
+            confirm_at: usize,
+            dropped: bool,
+        }
+
+        let asset = AssetId::from_slice(&[7u8; 32]).unwrap();
+        let scripts: Vec<elements::Script> = (0..6)
+            .map(|i| {
+                let mut b = vec![0x00, 0x14];
+                b.extend(std::iter::repeat(i as u8 + 1).take(20));
+                elements::Script::from(b)
+            })
+            .collect();
+        let external = {
+            let mut b = vec![0x00, 0x14];
+            b.extend(std::iter::repeat(0xee).take(20));
+            elements::Script::from(b)
+        };
+        let secrets = |v: u64| {
+            TxOutSecrets::new(
+                asset,
+                AssetBlindingFactor::zero(),
+                v,
+                ValueBlindingFactor::zero(),
+            )
+        };
+
+        let seeds: u64 = std::env::var("LWK_FUZZ_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut cache = Cache::default();
+            for (i, s) in scripts.iter().enumerate() {
+                cache
+                    .paths
+                    .insert(s.clone(), (Chain::External, ChildNumber::from(i as u32)));
+            }
+            let mut sim: Vec<SimTx> = vec![];
+            let mut sim_unspent: Vec<OutPoint> = vec![];
+            let mut height = 100u32;
+            let mut ext_counter = 0u32;
+            type Rec = (
+                Vec<(Txid, Option<u32>)>,
+                Vec<Txid>,
+                Vec<(Txid, Transaction)>,
+                Vec<(OutPoint, TxOutSecrets)>,
+            );
+            let mut recorded: Vec<Rec> = vec![];
+
+            for step in 0..60usize {
+                // create 0..2 wallet txs spending our own unspent coins (or an external coin)
+                let n_new = rng.gen_range(0..3);
+                for _ in 0..n_new {
+                    let mut inputs = vec![];
+                    for _ in 0..rng.gen_range(0..3) {
+                        if sim_unspent.is_empty() {
+                            break;
+                        }
+                        let idx = rng.gen_range(0..sim_unspent.len());
+                        inputs.push(sim_unspent.swap_remove(idx));
+                    }
+                    if inputs.is_empty() {
+                        ext_counter += 1;
+                        let mut b = [0u8; 32];
+                        b[..4].copy_from_slice(&ext_counter.to_le_bytes());
+                        b[31] = 0xaa;
+                        inputs.push(OutPoint::new(Txid::from_slice(&b).unwrap(), 0));
+                    }
+                    let mut outputs = vec![];
+                    for _ in 0..rng.gen_range(1..4) {
+                        let spk = if rng.gen_bool(0.8) {
+                            scripts[rng.gen_range(0..scripts.len())].clone()
+                        } else {
+                            external.clone()
+                        };
+                        outputs.push(TxOut {
+                            asset: Asset::Explicit(asset),
+                            value: Value::Explicit(rng.gen_range(1..1000)),
+                            nonce: Nonce::Null,
+                            script_pubkey: spk,
+                            witness: Default::default(),
+                        });
+                    }
+                    let tx = Transaction {
+                        version: 2,
+                        lock_time: elements::LockTime::ZERO,
+                        input: inputs
+                            .iter()
+                            .map(|op| TxIn {
+                                previous_output: *op,
+                                is_pegin: false,
+                                script_sig: elements::Script::new(),
+                                sequence: Sequence::MAX,
+                                asset_issuance: Default::default(),
+                                witness: Default::default(),
+                            })
+                            .collect(),
+                        output: outputs,
+                    };
+                    let txid = tx.txid();
+                    for (v, o) in tx.output.iter().enumerate() {
+                        if cache.paths.contains_key(&o.script_pubkey) {
+                            sim_unspent.push(OutPoint::new(txid, v as u32));
+                        }
+                    }
+                    let confirm_delay = rng.gen_range(0..4);
+                    sim.push(SimTx {
+                        tx,
+                        height: None,
+                        confirm_at: step + confirm_delay,
+                        dropped: false,
+                    });
+                }
+                // sometimes a childless unconfirmed tx falls out of the mempool
+                if rng.gen_bool(0.15) {
+                    let live_inputs: HashSet<OutPoint> = sim
+                        .iter()
+                        .filter(|t| !t.dropped)
+                        .flat_map(|t| t.tx.input.iter().map(|i| i.previous_output))
+                        .collect();
+                    let candidates: Vec<usize> = sim
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| !t.dropped && t.height.is_none())
+                        .filter(|(_, t)| {
+                            let txid = t.tx.txid();
+                            !(0..t.tx.output.len())
+                                .any(|v| live_inputs.contains(&OutPoint::new(txid, v as u32)))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !candidates.is_empty() {
+                        let i = candidates[rng.gen_range(0..candidates.len())];
+                        sim[i].dropped = true;
+                        let txid = sim[i].tx.txid();
+                        sim_unspent.retain(|op| op.txid != txid);
+                        // its inputs become spendable again (if they are ours)
+                        let live_txids: HashSet<Txid> = sim
+                            .iter()
+                            .filter(|t| !t.dropped)
+                            .map(|t| t.tx.txid())
+                            .collect();
+                        for op in sim[i].tx.input.iter().map(|i| i.previous_output) {
+                            if live_txids.contains(&op.txid) {
+                                sim_unspent.push(op);
+                            }
+                        }
+                    }
+                }
+                // confirmations
+                let mut any = false;
+                for t in sim.iter_mut() {
+                    if !t.dropped && t.height.is_none() && t.confirm_at <= step {
+                        t.height = Some(height);
+                        any = true;
+                    }
+                }
+                if any {
+                    height += 1;
+                }
+
+                // the update exactly as full_scan would build it
+                let live_txids: HashSet<Txid> = sim
+                    .iter()
+                    .filter(|t| !t.dropped)
+                    .map(|t| t.tx.txid())
+                    .collect();
+                let mut txid_height_new = vec![];
+                let mut txs = vec![];
+                let mut unblinds = vec![];
+                for t in sim.iter().filter(|t| !t.dropped) {
+                    let txid = t.tx.txid();
+                    match cache.heights.get(&txid) {
+                        Some(h) if *h == t.height => {}
+                        _ => txid_height_new.push((txid, t.height)),
+                    }
+                    if !cache.txids.contains(&txid) {
+                        for (v, o) in t.tx.output.iter().enumerate() {
+                            if cache.paths.contains_key(&o.script_pubkey) {
+                                let val = match o.value {
+                                    Value::Explicit(x) => x,
+                                    _ => 0,
+                                };
+                                unblinds.push((OutPoint::new(txid, v as u32), secrets(val)));
+                            }
+                        }
+                        txs.push((txid, t.tx.clone()));
+                    }
+                }
+                let txid_height_delete: Vec<Txid> = cache
+                    .heights
+                    .keys()
+                    .filter(|k| !live_txids.contains(*k))
+                    .cloned()
+                    .collect();
+                if txid_height_new.is_empty() && txid_height_delete.is_empty() && txs.is_empty() {
+                    continue;
+                }
+                if std::env::var("LWK_FUZZ_TRACE").ok().as_deref() == Some(&seed.to_string()) {
+                    let short = |t: &Txid| t.to_string()[..8].to_owned();
+                    eprintln!("-- step {step}");
+                    for (t, h) in &txid_height_new {
+                        eprintln!("   height {} -> {:?}", short(t), h);
+                    }
+                    for t in &txid_height_delete {
+                        eprintln!("   delete {}", short(t));
+                    }
+                    for (t, tx) in &txs {
+                        eprintln!(
+                            "   body   {} inputs {:?} outputs {}",
+                            short(t),
+                            tx.input
+                                .iter()
+                                .map(|i| format!("{}:{}", short(&i.previous_output.txid), i.previous_output.vout))
+                                .collect::<Vec<_>>(),
+                            tx.output.len()
+                        );
+                    }
+                }
+                cache.extend_unblinded(unblinds.iter().cloned());
+                cache
+                    .update(&txid_height_new, &txid_height_delete, &txs, false, vec![], false)
+                    .unwrap();
+                if std::env::var("LWK_FUZZ_TRACE").ok().as_deref() == Some(&seed.to_string()) {
+                    let short = |t: &Txid| t.to_string()[..8].to_owned();
+                    eprintln!(
+                        "   unspent now {:?}",
+                        cache.unspent.keys().map(|o| format!("{}:{}", short(&o.txid), o.vout)).collect::<Vec<_>>()
+                    );
+                }
+                recorded.push((txid_height_new, txid_height_delete, txs, unblinds));
+
+                // derived truth: owned outputs of live txs minus inputs of live txs
+                let live: Vec<&SimTx> = sim.iter().filter(|t| !t.dropped).collect();
+                let spent: HashSet<OutPoint> = live
+                    .iter()
+                    .flat_map(|t| t.tx.input.iter().map(|i| i.previous_output))
+                    .collect();
+                let mut truth = HashSet::new();
+                for t in &live {
+                    let txid = t.tx.txid();
+                    for (v, o) in t.tx.output.iter().enumerate() {
+                        let op = OutPoint::new(txid, v as u32);
+                        if cache.paths.contains_key(&o.script_pubkey) && !spent.contains(&op) {
+                            truth.insert(op);
+                        }
+                    }
+                }
+                let got: HashSet<OutPoint> = cache.unspent.keys().cloned().collect();
+                assert_eq!(
+                    got,
+                    truth,
+                    "seed {seed} step {step}: phantom {:?} missing {:?}",
+                    got.difference(&truth).collect::<Vec<_>>(),
+                    truth.difference(&got).collect::<Vec<_>>()
+                );
+            }
+
+            // a restore replays the same updates into a fresh cache
+            let mut restored = Cache::default();
+            for (i, s) in scripts.iter().enumerate() {
+                restored
+                    .paths
+                    .insert(s.clone(), (Chain::External, ChildNumber::from(i as u32)));
+            }
+            for (n, d, txs, ub) in &recorded {
+                restored.extend_unblinded(ub.iter().cloned());
+                restored.update(n, d, txs, false, vec![], false).unwrap();
+            }
+            let a: HashSet<OutPoint> = cache.unspent.keys().cloned().collect();
+            let b: HashSet<OutPoint> = restored.unspent.keys().cloned().collect();
+            assert_eq!(a, b, "seed {seed}: restore differs from live");
+        }
     }
 }
