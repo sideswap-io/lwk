@@ -293,8 +293,21 @@ pub fn pset_balance(
                         }
                         (txout_secrets.asset, txout_secrets.value)
                     }
-                    // SIDESWAP: Allow spending explicit inputs
-                    (None, None, Some(asset), Some(value), None, None) => (asset, value),
+                    // SIDESWAP: Allow spending explicit inputs.
+                    (None, None, declared_asset, declared_value, None, None) => {
+                        let (Some(asset), Some(value)) =
+                            (txout.asset.explicit(), txout.value.explicit())
+                        else {
+                            // Null asset or value in the spent output
+                            return Err(Error::InputNotBlinded { idx });
+                        };
+                        if declared_asset.is_some_and(|a| a != asset)
+                            || declared_value.is_some_and(|v| v != value)
+                        {
+                            return Err(Error::InputCommitmentsMismatch { idx });
+                        }
+                        (asset, value)
+                    }
                     _ => return Err(Error::InputNotBlinded { idx }),
                 };
 
